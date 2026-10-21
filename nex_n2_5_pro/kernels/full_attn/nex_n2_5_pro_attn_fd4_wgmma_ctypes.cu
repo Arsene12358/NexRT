@@ -1,5 +1,5 @@
 // Copyright (c) Nex-AGI. All rights reserved.
-//
+// Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -345,8 +345,8 @@ __device__ __forceinline__ void wgmma_fd4_combine_body(const float* __restrict__
                                                        const float* __restrict__ ws_l,
                                                        const bf16* __restrict__ ws_acc,
                                                        bf16* __restrict__ out, int ns,
-                                                       float scaling) {
-    const int o0 = blockIdx.x * DT, h = o0 / HD, d0 = o0 % HD, tid = threadIdx.x;
+                                                       float scaling, int unit) {
+    const int o0 = unit * DT, h = o0 / HD, d0 = o0 % HD, tid = threadIdx.x;
     const float scale2 = scaling * 1.4426950408889634f;
     extern __shared__ bf16 sm[];
     __shared__ float red[BLK], den_red[BLK];
@@ -396,8 +396,12 @@ __global__ __launch_bounds__(256) void wgmma_fd4_mega(
         wgmma_fd4_partial_body<STAGES>(Kmap, Vmap, Qmap, ws_m, ws_l, ws_acc, S, ns, scaling);
     __syncthreads();
     grid_bar_sync_modern(barrier_counter, ns);
-    if (blockIdx.x < NH * HD / 8)
-        wgmma_fd4_combine_body<8, 256>(ws_m, ws_l, ws_acc, out, ns, scaling);
+    // ns < NH * HD / 8 on parts with fewer SMs (H20: 78): a CTA then combines
+    // several 8-wide slices; the barrier guards the reused red/sm buffers.
+    for (int unit = blockIdx.x; unit < NH * HD / 8; unit += gridDim.x) {
+        if (unit != static_cast<int>(blockIdx.x)) __syncthreads();
+        wgmma_fd4_combine_body<8, 256>(ws_m, ws_l, ws_acc, out, ns, scaling, unit);
+    }
 }
 
 static CUtensorMap encode_map(void* ptr, int outer, int inner, int box_outer, int box_inner) {
@@ -437,8 +441,11 @@ static int launch_wgmma_fd4_mega(const void* Q, const void* K, const void* V, in
     }
     cudaStream_t st = reinterpret_cast<cudaStream_t>(stream);
     if (!ctx) return static_cast<int>(cudaErrorInvalidDevicePointer);
-    if (ns != NH * HD / 8) return static_cast<int>(cudaErrorInvalidConfiguration);
-    if (ns > cooperative_capacity) return static_cast<int>(cudaErrorInvalidConfiguration);
+    if (ns < 1 || ns > NH * HD / 8) return static_cast<int>(cudaErrorInvalidConfiguration);
+    // All split CTAs must be co-resident for the grid barrier; fewer SMs
+    // than splits (H20: 78) means fewer, longer splits.
+    if (ns > cooperative_capacity) ns = cooperative_capacity;
+    if (ns < 1) return static_cast<int>(cudaErrorInvalidConfiguration);
     float* wm_p = static_cast<float*>(wm);
     float* wl_p = static_cast<float*>(wl);
     bf16* wa_p = static_cast<bf16*>(wa);
