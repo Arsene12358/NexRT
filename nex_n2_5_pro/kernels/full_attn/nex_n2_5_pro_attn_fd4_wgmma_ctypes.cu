@@ -117,7 +117,10 @@ __device__ __forceinline__ void grid_bar_sync_modern(uint32_t* counter, int num_
     __syncthreads();
 }
 
-template <int STAGES>
+// kSliceLoop is not used in the body. It gives each wgmma_fd4_mega instantiation its own static
+// shared variables. Shared ones would move to module scope, where ptxas places them after the
+// combine buffers, and the released kernel would lose its machine code.
+template <int STAGES, bool kSliceLoop>
 __device__ __forceinline__ void wgmma_fd4_partial_body(
     const CUtensorMap& Kmap, const CUtensorMap& Vmap, const CUtensorMap& Qmap,
     float* __restrict__ ws_m, float* __restrict__ ws_l, bf16* __restrict__ ws_acc, int S, int ns,
@@ -340,13 +343,16 @@ __device__ __forceinline__ void wgmma_fd4_partial_body(
     }
 }
 
-template <int DT, int BLK>
+// Combines the 8-wide output slice `unit`. kSliceLoop false (128 splits) keeps the released
+// unsigned blockIdx.x * DT, so the released kernel keeps the released machine code.
+template <int DT, int BLK, bool kSliceLoop>
 __device__ __forceinline__ void wgmma_fd4_combine_body(const float* __restrict__ ws_m,
                                                        const float* __restrict__ ws_l,
                                                        const bf16* __restrict__ ws_acc,
                                                        bf16* __restrict__ out, int ns,
                                                        float scaling, int unit) {
-    const int o0 = unit * DT, h = o0 / HD, d0 = o0 % HD, tid = threadIdx.x;
+    const int o0 = kSliceLoop ? unit * DT : blockIdx.x * DT, h = o0 / HD, d0 = o0 % HD,
+              tid = threadIdx.x;
     const float scale2 = scaling * 1.4426950408889634f;
     extern __shared__ bf16 sm[];
     __shared__ float red[BLK], den_red[BLK];
@@ -385,7 +391,10 @@ __device__ __forceinline__ void wgmma_fd4_combine_body(const float* __restrict__
     }
 }
 
-template <int STAGES>
+// kSliceLoop false: ns == NH * HD / 8 (H100, H200), the released kernel with one slice per CTA.
+// kSliceLoop true: fewer splits (H20). A slice loop in the released kernel would change how the
+// compiler unrolls the combine loops, so only this instantiation has it.
+template <int STAGES, bool kSliceLoop>
 __global__ __launch_bounds__(256) void wgmma_fd4_mega(
     const __grid_constant__ CUtensorMap Kmap, const __grid_constant__ CUtensorMap Vmap,
     const __grid_constant__ CUtensorMap Qmap, float* __restrict__ ws_m, float* __restrict__ ws_l,
@@ -393,14 +402,21 @@ __global__ __launch_bounds__(256) void wgmma_fd4_mega(
     int ns, float scaling, uint32_t* barrier_counter) {
     if (seqlen) S = static_cast<int>(seqlen[1]) + 1;
     if (threadIdx.x < 128)
-        wgmma_fd4_partial_body<STAGES>(Kmap, Vmap, Qmap, ws_m, ws_l, ws_acc, S, ns, scaling);
+        wgmma_fd4_partial_body<STAGES, kSliceLoop>(Kmap, Vmap, Qmap, ws_m, ws_l, ws_acc, S, ns,
+                                                   scaling);
     __syncthreads();
     grid_bar_sync_modern(barrier_counter, ns);
-    // ns < NH * HD / 8 on parts with fewer SMs (H20: 78): a CTA then combines
-    // several 8-wide slices; the barrier guards the reused red/sm buffers.
-    for (int unit = blockIdx.x; unit < NH * HD / 8; unit += gridDim.x) {
-        if (unit != static_cast<int>(blockIdx.x)) __syncthreads();
-        wgmma_fd4_combine_body<8, 256>(ws_m, ws_l, ws_acc, out, ns, scaling, unit);
+    if constexpr (kSliceLoop) {
+        // ns < NH * HD / 8 on parts with fewer SMs (H20: 78): a CTA then combines
+        // several 8-wide slices; the barrier guards the reused red/sm buffers.
+        for (int unit = blockIdx.x; unit < NH * HD / 8; unit += gridDim.x) {
+            if (unit != static_cast<int>(blockIdx.x)) __syncthreads();
+            wgmma_fd4_combine_body<8, 256, true>(ws_m, ws_l, ws_acc, out, ns, scaling, unit);
+        }
+    } else {
+        if (blockIdx.x < NH * HD / 8)
+            wgmma_fd4_combine_body<8, 256, false>(ws_m, ws_l, ws_acc, out, ns, scaling,
+                                                  static_cast<int>(blockIdx.x));
     }
 }
 
@@ -430,12 +446,19 @@ static int launch_wgmma_fd4_mega(const void* Q, const void* K, const void* V, in
     static bool initialized = false;
     static int cooperative_capacity = 0;
     if (!initialized) {
-        cudaFuncSetAttribute(wgmma_fd4_mega<STAGES>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             smem);
-        int active_per_sm = 0, sm_count = 0;
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_per_sm, wgmma_fd4_mega<STAGES>, 256,
-                                                      smem);
+        cudaFuncSetAttribute(wgmma_fd4_mega<STAGES, false>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        cudaFuncSetAttribute(wgmma_fd4_mega<STAGES, true>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        int active_released = 0, active_slice_loop = 0, sm_count = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_released,
+                                                      wgmma_fd4_mega<STAGES, false>, 256, smem);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_slice_loop,
+                                                      wgmma_fd4_mega<STAGES, true>, 256, smem);
         cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0);
+        // The capacity holds for both kernels, so the one that runs is co-resident.
+        const int active_per_sm =
+            active_released < active_slice_loop ? active_released : active_slice_loop;
         cooperative_capacity = active_per_sm * sm_count;
         initialized = true;
     }
@@ -456,8 +479,12 @@ static int launch_wgmma_fd4_mega(const void* Q, const void* K, const void* V, in
     void* args[] = {
         &Kmap, &Vmap, &Qmap, &wm_p, &wl_p, &wa_p, &out_p, &S, &seqlen_p, &ns, &scaling, &counter_p,
     };
-    const cudaError_t error = cudaLaunchCooperativeKernel(
-        reinterpret_cast<const void*>(wgmma_fd4_mega<STAGES>), dim3(ns), dim3(256), args, smem, st);
+    // 128 splits run the released kernel, a capped split count runs the slice loop.
+    const void* kernel = ns == NH * HD / 8
+                             ? reinterpret_cast<const void*>(wgmma_fd4_mega<STAGES, false>)
+                             : reinterpret_cast<const void*>(wgmma_fd4_mega<STAGES, true>);
+    const cudaError_t error =
+        cudaLaunchCooperativeKernel(kernel, dim3(ns), dim3(256), args, smem, st);
     return static_cast<int>(error);
 }
 
