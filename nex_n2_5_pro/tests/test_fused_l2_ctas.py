@@ -18,8 +18,9 @@
 Both variants run through NexN25ProFusedL2ReduceResidLaunchCtas, in the plain form (x_resid NULL,
 fp32 out), the fused-residual form, and the fused-residual form with the wait-shadow prefetch that
 the decode engine passes (the kWaitPf instantiations), under three arrival skews. A captured
-64-block launch then replays 10,000 times with alternating inputs, and the per-block epochs must
-advance by 10,000.
+64-block launch then replays 10,000 times, and the per-block epochs must advance by 10,000.
+Consecutive launches use different input sets, so a block that reads its slots before the peers'
+pushes for that launch land reads another launch's values and fails the bitwise checks.
 
 No model weights required. Run on the GPU host from the repository root:
     torchrun --standalone --nproc_per_node=8 -m nex_n2_5_pro.tests.test_fused_l2_ctas
@@ -39,6 +40,13 @@ DIM, N_EXP, TOPK, RINTER = 4096, 512, 10, 128
 FP8 = torch.float8_e4m3fn
 REPLAYS = 10_000
 PF_BYTES = 4 << 20  # the decode engine clamps the next layer's prefetch range to 4 MiB
+# Input sets in rotation. A slot that a launch reads holds, before that launch's pushes land, the
+# values of the last earlier launch that wrote it at the same parity. In the replays (one variant)
+# that is the launch two earlier, so three sets suffice. In the eager loop the variants alternate,
+# and they map row pairs to different blocks, so after a switch that write can be three launches
+# earlier. Four sets keep it different there too.
+GRAPH_SETS = 3
+EAGER_SETS = 4
 
 
 def main():
@@ -80,7 +88,10 @@ def main():
     w2_scales = torch.rand(N_EXP, DIM // 128, device=device, generator=gen) + 0.5
     shared_W2 = torch.randn(DIM, RINTER, device=device, generator=gen).to(FP8)
     shared_w2_scales = torch.rand(DIM // 128, device=device, generator=gen) + 0.5
-    h_sets = [torch.randn(TOPK + 1, RINTER, device=device, generator=gen) for _ in range(2)]
+    h_sets = [
+        torch.randn(TOPK + 1, RINTER, device=device, generator=gen)
+        for _ in range(max(GRAPH_SETS, EAGER_SETS))
+    ]
     h = h_sets[0].clone()
     # Routing and the residual stream are replicated, so they are the same on every rank.
     common = torch.Generator().manual_seed(7)
@@ -119,7 +130,8 @@ def main():
         if rc:
             raise RuntimeError(f"FusedL2 launch failed: {rc}")
 
-    def run(form, ctas, skew):
+    def run(form, ctas, skew, input_set):
+        h.copy_(h_sets[input_set])
         out.fill_(float("nan"))  # rows that no block writes must not pass on stale values
         resid.copy_(x0)
         # Change the peer arrival order without changing any arithmetic input.
@@ -150,30 +162,40 @@ def main():
     check(f"automatic CTA count {ctas} on {sm} SMs", ctas == (128 if sm >= 128 else 64))
     check(f"{ctas} blocks at one block per SM on {sm} SMs", ctas <= sm)
 
+    # Each form and skew runs the 128-block variant on every input set, then the 64-block variant
+    # on the same sets, so consecutive launches never share a set. Outputs compare per set.
     first = {}
+    eager_runs = 0
     for form in ("plain", "resid", "resid_pf"):
         for skew in (0, 3, 7):
-            a, b = run(form, 128, skew), run(form, 64, skew)
-            tag = f"{form} skew {skew}"
-            check(f"{tag}: 64 equals 128", torch.equal(a.view(torch.uint8), b.view(torch.uint8)))
-            check(f"{tag}: ranks equal", all_ranks_bitwise_equal(b))
-            check(f"{tag}: status {status.item()}", status.item() == 0)
-            first.setdefault(form, b)
-            check(
-                f"{tag}: equals skew 0",
-                torch.equal(b.view(torch.uint8), first[form].view(torch.uint8)),
-            )
-    plain_out, resid_out = first["plain"], first["resid"]
+            a = [run(form, 128, skew, s) for s in range(EAGER_SETS)]
+            b = [run(form, 64, skew, s) for s in range(EAGER_SETS)]
+            eager_runs += 2 * EAGER_SETS
+            for s in range(EAGER_SETS):
+                tag = f"{form} skew {skew} set {s}"
+                check(
+                    f"{tag}: 64 equals 128",
+                    torch.equal(a[s].view(torch.uint8), b[s].view(torch.uint8)),
+                )
+                check(f"{tag}: ranks equal", all_ranks_bitwise_equal(b[s]))
+                first.setdefault((form, s), b[s])
+                check(
+                    f"{tag}: equals skew 0",
+                    torch.equal(b[s].view(torch.uint8), first[(form, s)].view(torch.uint8)),
+                )
+            check(f"{form} skew {skew}: status {status.item()}", status.item() == 0)
+    plain_out, resid_out = first[("plain", 0)], first[("resid", 0)]
 
-    # Torch reference: this rank's fp32 partial, rounded to bf16 for the wire, then the ranks
-    # summed in order r0..r7.
+    # Torch reference for input set 0: this rank's fp32 partial, rounded to bf16 for the wire, then
+    # the ranks summed in order r0..r7.
+    h0 = h_sets[0]
     acc = torch.zeros(DIM, device=device)
     for j in range(TOPK):
         e = int(topk_ids[j])
         w = W2[e].float() * w2_scales[e].repeat_interleave(128).view(DIM, 1)
-        acc += topk_weights[j] * (w @ h[j])
+        acc += topk_weights[j] * (w @ h0[j])
     sw = shared_W2.float() * shared_w2_scales.repeat_interleave(128).view(DIM, 1)
-    acc += sw @ h[TOPK]
+    acc += sw @ h0[TOPK]
     partials = [torch.empty_like(acc) for _ in range(world)]
     dist.all_gather(partials, acc)
     reference = torch.zeros(DIM, device=device)
@@ -187,16 +209,13 @@ def main():
     )
     check(
         "resid with prefetch equals resid",
-        torch.equal(first["resid_pf"].view(torch.uint8), resid_out.view(torch.uint8)),
+        torch.equal(first[("resid_pf", 0)].view(torch.uint8), resid_out.view(torch.uint8)),
     )
 
-    # Graph: capture the 64-block plain launch once and replay it 10,000 times. The input
-    # alternates between two sets, so a block that reads the other parity (the previous replay's
-    # values) fails the per-replay check.
-    eager = []
-    for h_set in h_sets:
-        h.copy_(h_set)
-        eager.append(run("plain", 64, 0))
+    # Graph: capture the 64-block plain launch once and replay it 10,000 times. Replay i uses
+    # input set i % 3 and reads parity (E + i) & 1. Before its pushes land, that slot holds set
+    # (i - 2) % 3 and the other parity holds set (i - 1) % 3, so a stale read of either fails.
+    eager = [run("plain", 64, 0, s) for s in range(GRAPH_SETS)]
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         launch("plain", 64)
@@ -205,11 +224,11 @@ def main():
     it_before = it_ctr.clone()
     mismatches = torch.zeros((), dtype=torch.int32, device=device)
     for i in range(REPLAYS):
-        h.copy_(h_sets[i & 1])
+        h.copy_(h_sets[i % GRAPH_SETS])
         graph.replay()
-        mismatches += (out.view(torch.int32) != eager[i & 1].view(torch.int32)).any()
+        mismatches += (out.view(torch.int32) != eager[i % GRAPH_SETS].view(torch.int32)).any()
     torch.cuda.synchronize()
-    graph_out, eager_out = out.clone(), eager[(REPLAYS - 1) & 1]
+    graph_out, eager_out = out.clone(), eager[(REPLAYS - 1) % GRAPH_SETS]
     check(
         f"graph equals eager, status {status.item()}",
         torch.equal(graph_out, eager_out) and status.item() == 0,
@@ -225,8 +244,8 @@ def main():
     failures = int(result.item())
     if rank == 0:
         print(
-            f"FusedL2 CTA variants: automatic {ctas} on {sm} SMs, 18 eager runs, relL2 {rel:.3e}, "
-            f"{REPLAYS} graph replays, failures={failures}",
+            f"FusedL2 CTA variants: automatic {ctas} on {sm} SMs, {eager_runs} eager runs, "
+            f"relL2 {rel:.3e}, {REPLAYS} graph replays, failures={failures}",
             flush=True,
         )
     dist.destroy_process_group()
