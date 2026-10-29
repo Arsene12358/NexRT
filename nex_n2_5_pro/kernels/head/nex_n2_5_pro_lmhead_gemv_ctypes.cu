@@ -1,5 +1,5 @@
 // Copyright (c) Nex-AGI. All rights reserved.
-//
+// Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -21,6 +21,11 @@
 // One CTA computes each row. CTA 0 also computes inv_rms while streaming h. W_fused contains the folded
 // (1+norm_w) factor; inv_rms is applied downstream because positive scaling does not change top-k IDs.
 // Output is FP32 (lm_head/sampler are precision-sensitive; the top-k consumes these logits directly).
+//
+// Two geometries write the same bits. Geometry 0 (released) runs one CTA per row. Geometry 1 (H20)
+// runs kH20RowsPerCta rows per CTA and issues every load before the first multiply, so that an SM
+// keeps more bytes in flight. The launcher selects geometry 1 on devices with fewer than 128 SMs;
+// NEXRT_H20_GEOMETRY overrides it (see lmhead_geometry).
 #ifndef NEXRT_NEX_N2_5_PRO_KERNEL_FAMILY
 #define NEXRT_NEX_N2_5_PRO_KERNEL_FAMILY bs1
 #endif
@@ -28,6 +33,10 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cub/block/block_reduce.cuh>
+
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
 
 namespace nexrt::sm90::nex_n2_5_pro::NEXRT_NEX_N2_5_PRO_KERNEL_FAMILY {
 constexpr int kDim = 4096;
@@ -70,6 +79,76 @@ __global__ __launch_bounds__(NT) void LmHeadGemvRowRmsCta0Kernel(
     }
 }
 
+// The H20 geometry: kRowsPerCta consecutive rows per CTA, and each thread issues all its loads (the
+// pairs of h, then the pairs of every row) before its first multiply. One row per CTA keeps 4 loads in
+// flight per thread, too few to fill the memory pipe of an H20 (78 SMs). Every row keeps the released
+// arithmetic: thread t sums the pairs t + NT * j in order j from 0.0f with the same expression, and the
+// same BlockReduce sums the NT partials, so both geometries write the same bits. The kernel overloads
+// the released kernel's name, so the MTP clone's rename and the kernel-name patterns of the graph tests
+// cover it, and the released instantiation keeps its symbol and machine code. The bound of 1 CTA per
+// SM lifts the register cap that ptxas otherwise sets for occupancy (32 registers, which moves 22 of
+// the 40 loads behind multiplies): all loads come first, in 56 registers, at 4 CTAs per SM.
+template <int NT, int kRowsPerCta>
+__global__ __launch_bounds__(NT, 1) void LmHeadGemvRowRmsCta0Kernel(
+    const __nv_bfloat16* __restrict__ h, const __nv_bfloat16* __restrict__ Wf,
+    float* __restrict__ logits, float* __restrict__ inv_rms, float eps) {
+    constexpr int kPairsPerThread = kDimPairs / NT;
+    static_assert(kDimPairs % NT == 0, "every thread sums the same number of pairs");
+    static_assert(kRows % kRowsPerCta == 0, "the grid covers every row once");
+    const int row0 = blockIdx.x * kRowsPerCta;
+    if (row0 >= kRows) {
+        return;
+    }
+    const auto* __restrict__ h2 = reinterpret_cast<const __nv_bfloat162*>(h);
+    __nv_bfloat162 hv[kPairsPerThread];
+    __nv_bfloat162 wv[kRowsPerCta][kPairsPerThread];
+#pragma unroll
+    for (int j = 0; j < kPairsPerThread; ++j) {
+        hv[j] = h2[threadIdx.x + j * NT];
+    }
+#pragma unroll
+    for (int r = 0; r < kRowsPerCta; ++r) {
+        const auto* __restrict__ w2 =
+            reinterpret_cast<const __nv_bfloat162*>(Wf + static_cast<size_t>(row0 + r) * kDim);
+#pragma unroll
+        for (int j = 0; j < kPairsPerThread; ++j) {
+            wv[r][j] = w2[threadIdx.x + j * NT];
+        }
+    }
+    float acc[kRowsPerCta];
+#pragma unroll
+    for (int r = 0; r < kRowsPerCta; ++r) {
+        acc[r] = 0.0f;
+#pragma unroll
+        for (int j = 0; j < kPairsPerThread; ++j) {
+            const float2 hf = __bfloat1622float2(hv[j]);
+            const float2 wf = __bfloat1622float2(wv[r][j]);
+            acc[r] += hf.x * wf.x + hf.y * wf.y;
+        }
+    }
+    __shared__ typename cub::BlockReduce<float, NT>::TempStorage br_tmp[kRowsPerCta];
+#pragma unroll
+    for (int r = 0; r < kRowsPerCta; ++r) {
+        const float sum = cub::BlockReduce<float, NT>(br_tmp[r]).Sum(acc[r]);
+        if (threadIdx.x == 0) {
+            logits[row0 + r] = sum;
+        }  // RAW (inv_rms applied downstream)
+    }
+    if (row0 == 0) {
+        float rms_acc = 0.0f;
+#pragma unroll
+        for (int j = 0; j < kPairsPerThread; ++j) {
+            const float2 hf = __bfloat1622float2(hv[j]);
+            rms_acc += hf.x * hf.x + hf.y * hf.y;
+        }
+        __syncthreads();  // reuse br_tmp[0] for the CTA0 variance reduce
+        const float sq = cub::BlockReduce<float, NT>(br_tmp[0]).Sum(rms_acc);
+        if (threadIdx.x == 0) {
+            inv_rms[0] = rsqrtf(sq * kInvDim + eps);
+        }
+    }
+}
+
 template <int NT>
 int LaunchRowRms(const void* h, const void* Wf, void* logits, float* inv_rms, float eps,
                  void* stream) {
@@ -78,13 +157,86 @@ int LaunchRowRms(const void* h, const void* Wf, void* logits, float* inv_rms, fl
         static_cast<float*>(logits), inv_rms, eps);
     return static_cast<int>(cudaGetLastError());
 }
+
+// Rows per CTA of the H20 geometry. Of 1, 2, 4, 5 and 8, 4 ran fastest in a microbenchmark on an H20
+// (73 us against 103 us for the released geometry, with the L2 flushed before each launch).
+constexpr int kH20RowsPerCta = 4;
+
+template <int NT, int kRowsPerCta>
+int LaunchRowsRms(const void* h, const void* Wf, void* logits, float* inv_rms, float eps,
+                  void* stream) {
+    LmHeadGemvRowRmsCta0Kernel<NT, kRowsPerCta>
+        <<<dim3(kRows / kRowsPerCta), dim3(NT), 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<const __nv_bfloat16*>(h), static_cast<const __nv_bfloat16*>(Wf),
+            static_cast<float*>(logits), inv_rms, eps);
+    return static_cast<int>(cudaGetLastError());
+}
+
+// geometry 0 launches the released kernel and grid, geometry 1 the H20 geometry. Other values return
+// cudaErrorInvalidValue without a launch.
+inline int LaunchGeometry(const void* h, const void* Wf, void* logits, float* inv_rms, float eps,
+                          int geometry, void* stream) {
+    if (geometry == 0) {
+        return LaunchRowRms<256>(h, Wf, logits, inv_rms, eps, stream);
+    }
+    if (geometry == 1) {
+        return LaunchRowsRms<256, kH20RowsPerCta>(h, Wf, logits, inv_rms, eps, stream);
+    }
+    return static_cast<int>(cudaErrorInvalidValue);
+}
+
+// Geometry selection: 1 on devices with fewer than 128 SMs (H20: 78), else 0 (H100 and H200: 132).
+// NEXRT_H20_GEOMETRY=0 or =1 overrides it, unset or empty selects automatically, and any other value
+// is an error. Errors return a negative CUDA error code. The kernel reads only this rank's shard, so
+// ranks need not agree.
+inline int query_lmhead_geometry(int device) {
+    const char* env = std::getenv("NEXRT_H20_GEOMETRY");
+    if (env != nullptr && env[0] != '\0') {
+        if (std::strcmp(env, "0") == 0) return 0;
+        if (std::strcmp(env, "1") == 0) return 1;
+        return -static_cast<int>(cudaErrorInvalidValue);
+    }
+    int sms = 0;
+    const cudaError_t err = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+    if (err != cudaSuccess) return -static_cast<int>(err);
+    return sms < 128 ? 1 : 0;
+}
+
+// The selection is fixed per process and device: the query runs once, and later launches only read
+// the cached value.
+inline int lmhead_geometry() {
+    constexpr int kCachedDevices = 64;
+    static std::atomic<int> cached[kCachedDevices];  // geometry + 1, 0 until a query succeeds
+    int device = 0;
+    const cudaError_t err = cudaGetDevice(&device);
+    if (err != cudaSuccess) return -static_cast<int>(err);
+    if (device < 0 || device >= kCachedDevices) return query_lmhead_geometry(device);
+    const int stored = cached[device].load(std::memory_order_relaxed);
+    if (stored != 0) return stored - 1;
+    const int geometry = query_lmhead_geometry(device);
+    if (geometry >= 0) cached[device].store(geometry + 1, std::memory_order_relaxed);
+    return geometry;
+}
 }  // namespace nexrt::sm90::nex_n2_5_pro::NEXRT_NEX_N2_5_PRO_KERNEL_FAMILY
 using namespace nexrt::sm90::nex_n2_5_pro::NEXRT_NEX_N2_5_PRO_KERNEL_FAMILY;
 extern "C" {
 int NexN25ProLmHeadGemvLaunch(const void* h, const void* Wf, void* o, float* r, float e, void* s) {
-    return LaunchRowRms<256>(h, Wf, o, r, e, s);
+    const int geometry = lmhead_geometry();
+    if (geometry < 0) return -geometry;
+    return LaunchGeometry(h, Wf, o, r, e, geometry, s);
 }
 #ifndef NEXRT_MTP_RUNTIME_ONLY
+// The geometry that NexN25ProLmHeadGemvLaunch uses on the current device: 0 or 1, or a negative CUDA
+// error code (an invalid NEXRT_H20_GEOMETRY gives -cudaErrorInvalidValue). head.py checks it at start.
+int NexN25ProLmHeadGemvGeometry() { return lmhead_geometry(); }
+
+// NexN25ProLmHeadGemvLaunch with an explicit geometry: 0 = released, 1 = H20. Other values return
+// cudaErrorInvalidValue without a launch.
+int NexN25ProLmHeadGemvLaunchGeometry(const void* h, const void* Wf, void* o, float* r, float e,
+                                      int geometry, void* s) {
+    return LaunchGeometry(h, Wf, o, r, e, geometry, s);
+}
+
 const char* NexN25ProLmHeadCudaErrorString(int code) {
     return cudaGetErrorString(static_cast<cudaError_t>(code));
 }

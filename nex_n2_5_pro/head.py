@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) Nex-AGI. All rights reserved.
-#
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -65,6 +65,19 @@ def _sp():
     return ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
 
 
+def lmhead_geometry(lib):
+    """Return the GEMV geometry that NexN25ProLmHeadGemvLaunch uses on this device: 0 (released) or
+    1 (H20, below 128 SMs). Both write the same bits, and the GEMV reads only this rank's shard, so
+    ranks need not agree. An invalid NEXRT_H20_GEOMETRY makes every launch fail: stop at start."""
+    geometry = lib.NexN25ProLmHeadGemvGeometry()
+    if geometry not in (0, 1):
+        raise RuntimeError(
+            f"invalid LM head geometry {geometry}. A negative value is a CUDA error code. "
+            "NEXRT_H20_GEOMETRY must be unset, empty, 0 or 1."
+        )
+    return geometry
+
+
 class Head:
     def __init__(self, rank, dev, ext=None):
         self.rank, self.dev = rank, dev
@@ -72,6 +85,11 @@ class Head:
         vp, cf, ci, cu = ctypes.c_void_p, ctypes.c_float, ctypes.c_int, ctypes.c_ulonglong
         g = ctypes.CDLL(str(build("nex_n2_5_pro_lmhead_gemv_ctypes")))
         g.NexN25ProLmHeadGemvLaunch.argtypes = [vp, vp, vp, vp, cf, vp]
+        g.NexN25ProLmHeadGemvGeometry.argtypes = []
+        g.NexN25ProLmHeadGemvGeometry.restype = ci
+        geometry = lmhead_geometry(g)
+        if rank == 0:
+            print(f"[head] LM head geometry={geometry}", flush=True)
         t = ctypes.CDLL(str(build("nex_n2_5_pro_lmhead_topk_ctypes")))
         t.NexN25ProLmHeadTopkProducerLaunch.argtypes = [vp] * 5 + [cu, vp, ci, vp, vp]
         t.NexN25ProLmHeadTopkReducerLaunch.argtypes = [vp] * 10
