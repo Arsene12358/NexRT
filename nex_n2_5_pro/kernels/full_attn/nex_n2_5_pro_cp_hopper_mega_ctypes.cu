@@ -1,5 +1,5 @@
 // Copyright (c) Nex-AGI. All rights reserved.
-//
+// Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -13,9 +13,10 @@
 // limitations under the License.
 
 // Production context-parallel attention megakernel for H100. A fixed 128-CTA
-// grid computes the local WGMMA partial, combines it after a reset-free
-// cooperative barrier, and publishes CP readiness. Sequence length remains
-// device-driven, with a masked path only for the final 64-token tile.
+// grid (64 CTAs where 128 do not fit at once, as on H20) computes the local
+// WGMMA partial, combines it after a reset-free cooperative barrier, and
+// publishes CP readiness. Sequence length remains device-driven, with a
+// masked path only for the final 64-token tile.
 
 #ifndef NEXRT_NEX_N2_5_PRO_KERNEL_FAMILY
 #define NEXRT_NEX_N2_5_PRO_KERNEL_FAMILY bs1
@@ -24,11 +25,14 @@
 #include "nex_n2_5_pro_cp_hopper_common.cuh"
 
 #include <cooperative_groups.h>
+#include <cstdlib>
+#include <cstring>
 
 namespace nexrt::sm90::nex_n2_5_pro::NEXRT_NEX_N2_5_PRO_KERNEL_FAMILY {
 constexpr int kWsThreads = 256;
 constexpr int kMathThreads = 128;
 constexpr int kNumSplit128 = 128;
+constexpr int kNumSplit64 = 64;
 constexpr int kPvDChunk = 64;
 constexpr int kPvChunks = kHeadDim / kPvDChunk;
 constexpr int kKvStages = 1;
@@ -51,7 +55,7 @@ __device__ __forceinline__ void setmaxnreg_dec() {
 }
 
 // Reusable sense-reversing device-wide barrier.  Cooperative launch is a
-// correctness requirement: all 128 CTAs must be resident while they spin.
+// correctness requirement: all CTAs of the grid must be resident while they spin.
 // The high bit is the sense and the low 31 bits form the arrival counter.
 __device__ __forceinline__ void grid_bar_sync_modern(uint32_t* counter, int num_blocks) {
     constexpr uint32_t kTag = 0x80000000u;
@@ -192,7 +196,8 @@ __device__ __forceinline__ bool Raw16HopperWsPartialBody(
     const CUtensorMap* k_desc, const CUtensorMap* q_desc, const CUtensorMap* v_desc,
     bf16* __restrict__ op, bf16* __restrict__ glse, int seqlen_arg, const int* __restrict__ slot,
     int cp_rank, int cp) {
-    static_assert(NumSplit == kNumSplit128, "production path uses 128 CTAs");
+    static_assert(NumSplit == kNumSplit128 || NumSplit == kNumSplit64,
+                  "production path uses 128 or 64 CTAs");
     static_assert(QkHeadChunk == 32 || QkHeadChunk == 64, "unsupported QK chunk");
 
     constexpr int kQkChunks = kHeadDim / QkHeadChunk;
@@ -644,7 +649,8 @@ __global__ __launch_bounds__(kWsThreads, 1) void Raw16HopperWsStageSwitchPublish
     uint32_t* __restrict__ grid_counter, const int* __restrict__ slot, int cp_rank, int cp,
     unsigned long long ready_mc, int* __restrict__ ready_status, int* __restrict__ it_ctr,
     int* __restrict__ cur_gen) {
-    static_assert(NumSplit == kNumSplit128, "stage-switch path requires 128 CTAs");
+    static_assert(NumSplit == kNumSplit128 || NumSplit == kNumSplit64,
+                  "stage-switch path requires 128 or 64 CTAs");
     static_assert(QkHeadChunk == 64, "stage-switch path requires 64-head QK chunks");
     static_assert(kHeadDim / 32 == 8, "combine CTA remap assumes eight D blocks");
 
@@ -659,11 +665,20 @@ __global__ __launch_bounds__(kWsThreads, 1) void Raw16HopperWsStageSwitchPublish
 
     constexpr int kCombineWarps = 8;
     constexpr int kCombineDBlocks = kHeadDim / 32;
-    const int dblock = static_cast<int>(blockIdx.x) & (kCombineDBlocks - 1);
-    const int head = static_cast<int>(blockIdx.x) / kCombineDBlocks;
+    constexpr int kCombineUnits = kHeads * kCombineDBlocks;
     extern __shared__ __align__(1024) char smem[];
-    Raw16LocalCombineBody<kCombineWarps, true>(op, glse, NumSplit, cp_ctx_partial, cp_lse_partial,
-                                               dblock, head, reinterpret_cast<float*>(smem));
+    // One (head, D block) unit per CTA on the 128-CTA grid; a 64-CTA grid takes two units per CTA.
+    for (int unit = static_cast<int>(blockIdx.x); unit < kCombineUnits;
+         unit += static_cast<int>(gridDim.x)) {
+        if (unit != static_cast<int>(blockIdx.x)) {
+            __syncthreads();  // the units reuse the same shared memory
+        }
+        const int dblock = unit & (kCombineDBlocks - 1);
+        const int head = unit / kCombineDBlocks;
+        Raw16LocalCombineBody<kCombineWarps, true>(op, glse, NumSplit, cp_ctx_partial,
+                                                   cp_lse_partial, dblock, head,
+                                                   reinterpret_cast<float*>(smem));
+    }
 
     grid_bar_sync_modern(grid_counter, NumSplit);
     if (blockIdx.x == 0 && threadIdx.x == 0) {
@@ -694,6 +709,72 @@ static CUresult make_k_qk_map(void* kv, int seqlen_kv, CUtensorMap* map) {
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 }
 
+constexpr int kStageSwitchSmem = static_cast<int>(
+    (kHeads * kHeadDim + 2 * kKvStages * kBlockN * kHeadDim + kBlockN * kHeads) * sizeof(bf16));
+using StageSwitchKernel = decltype(&Raw16HopperWsStageSwitchPublishDynKernel<kNumSplit128, 64>);
+
+// Number of blocks of one stage-switch variant that can be resident at once on this device.
+static cudaError_t stage_switch_capacity(StageSwitchKernel kernel, int* capacity) {
+    cudaError_t status =
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kStageSwitchSmem);
+    if (status != cudaSuccess) {
+        return status;
+    }
+
+    int active_blocks_per_sm = 0;
+    status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks_per_sm, kernel,
+                                                           kWsThreads, kStageSwitchSmem);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    int device = 0;
+    int sm_count = 0;
+    status = cudaGetDevice(&device);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    status = cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    *capacity = active_blocks_per_sm * sm_count;
+    return cudaSuccess;
+}
+
+// 128 if the 128-split grid fits at once, else 64 if the 64-split grid fits, else a negative CUDA
+// error code. NEXRT_CP_SPLITS=64 or 128 overrides the choice (an empty value means unset, any other
+// value is an error); the launcher still refuses a forced grid that does not fit at once.
+static int stage_switch_num_splits() {
+    const char* forced = std::getenv("NEXRT_CP_SPLITS");
+    if (forced != nullptr && forced[0] != '\0') {
+        if (std::strcmp(forced, "128") == 0) {
+            return kNumSplit128;
+        }
+        if (std::strcmp(forced, "64") == 0) {
+            return kNumSplit64;
+        }
+        return -static_cast<int>(cudaErrorInvalidValue);
+    }
+    int capacity = 0;
+    cudaError_t status = stage_switch_capacity(
+        Raw16HopperWsStageSwitchPublishDynKernel<kNumSplit128, 64>, &capacity);
+    if (status != cudaSuccess) {
+        return -static_cast<int>(status);
+    }
+    if (capacity >= kNumSplit128) {
+        return kNumSplit128;
+    }
+    status =
+        stage_switch_capacity(Raw16HopperWsStageSwitchPublishDynKernel<kNumSplit64, 64>, &capacity);
+    if (status != cudaSuccess) {
+        return -static_cast<int>(status);
+    }
+    if (capacity >= kNumSplit64) {
+        return kNumSplit64;
+    }
+    return -static_cast<int>(cudaErrorCooperativeLaunchTooLarge);
+}
+
 static int launch_hopper_ws_stage_switch_publish_dyn(void* q, void* k, void* v, void* op,
                                                      void* glse, void* cp_ctx_partial,
                                                      void* cp_lse_partial, void* grid_counter,
@@ -709,39 +790,26 @@ static int launch_hopper_ws_stage_switch_publish_dyn(void* q, void* k, void* v, 
         return static_cast<int>(cudaErrorInvalidValue);
     }
 
-    const int smem = static_cast<int>(
-        (kHeads * kHeadDim + 2 * kKvStages * kBlockN * kHeadDim + kBlockN * kHeads) * sizeof(bf16));
-    auto kernel = Raw16HopperWsStageSwitchPublishDynKernel<kNumSplit128, 64>;
-    cudaError_t status =
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    const int num_split = stage_switch_num_splits();
+    if (num_split < 0) {
+        return -num_split;
+    }
+    const StageSwitchKernel kernel =
+        num_split == kNumSplit128 ? Raw16HopperWsStageSwitchPublishDynKernel<kNumSplit128, 64>
+                                  : Raw16HopperWsStageSwitchPublishDynKernel<kNumSplit64, 64>;
+    int capacity = 0;
+    cudaError_t status = stage_switch_capacity(kernel, &capacity);
     if (status != cudaSuccess) {
         return static_cast<int>(status);
     }
-
-    int active_blocks_per_sm = 0;
-    status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks_per_sm, kernel,
-                                                           kWsThreads, smem);
-    if (status != cudaSuccess) {
-        return static_cast<int>(status);
-    }
-    int device = 0;
-    int sm_count = 0;
-    status = cudaGetDevice(&device);
-    if (status != cudaSuccess) {
-        return static_cast<int>(status);
-    }
-    status = cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device);
-    if (status != cudaSuccess) {
-        return static_cast<int>(status);
-    }
-    if (active_blocks_per_sm * sm_count < kNumSplit128) {
+    if (capacity < num_split) {
         return static_cast<int>(cudaErrorCooperativeLaunchTooLarge);
     }
 
     cudaLaunchConfig_t config{};
-    config.gridDim = dim3(kNumSplit128, 1, 1);
+    config.gridDim = dim3(num_split, 1, 1);
     config.blockDim = dim3(kWsThreads, 1, 1);
-    config.dynamicSmemBytes = smem;
+    config.dynamicSmemBytes = kStageSwitchSmem;
     config.stream = stream;
     cudaLaunchAttribute launch_attr[1]{};
     launch_attr[0].id = cudaLaunchAttributeCooperative;
@@ -776,6 +844,10 @@ extern "C" int NexN25ProCpAttnMegaDynLaunch(void* q, void* k, void* v, void* op,
         q, k, v, op, glse, cp_ctx_partial, cp_lse_partial, grid_counter, slot, max_kv, cp_rank, 4,
         ready_mc, ready_status, it_ctr, cur_gen, reinterpret_cast<cudaStream_t>(stream));
 }
+
+// Split count that NexN25ProCpAttnMegaDynLaunch selects on the current device: 128 or 64, or a
+// negative CUDA error code.
+extern "C" int NexN25ProCpAttnMegaNumSplits() { return stage_switch_num_splits(); }
 
 extern "C" const char* NexN25ProCpAttnMegaErrorString(int code) {
     return cudaGetErrorString(static_cast<cudaError_t>(code));

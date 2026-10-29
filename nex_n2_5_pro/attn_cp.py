@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) Nex-AGI. All rights reserved.
-#
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -59,7 +59,7 @@ from nex_n2_5_pro.attn import (  # noqa: E402
 
 CP = 4  # ranks per CP group (share 1 KV head)
 NH_CP = 16  # q heads per KV head (all computed per rank under CP)
-NUM_SPLIT = 128  # fixed partial count used by the selected cooperative megakernel
+NUM_SPLIT = 128  # partial workspace size; the cooperative megakernel uses 128 or 64 splits
 
 _CP_GROUPS = None
 
@@ -70,6 +70,21 @@ def _cp_group(rank):
     if _CP_GROUPS is None:
         _CP_GROUPS = [dist.new_group([0, 1, 2, 3]), dist.new_group([4, 5, 6, 7])]
     return _CP_GROUPS[rank // CP]
+
+
+def _check_num_splits(megatl, rank, world, dev):
+    """All ranks must launch the same CP megakernel variant. Every rank all-gathers the split count
+    and raises on a failed query or a mismatch, so no rank is left waiting in a collective."""
+    mine = torch.tensor([megatl.NexN25ProCpAttnMegaNumSplits()], dtype=torch.int32, device=dev)
+    gathered = torch.empty(world, dtype=torch.int32, device=dev)
+    dist.all_gather_into_tensor(gathered, mine)
+    splits = gathered.tolist()
+    if min(splits) < 0:
+        raise RuntimeError(f"NexN25ProCpAttnMegaNumSplits failed (by rank): {splits}")
+    if len(set(splits)) != 1:
+        raise RuntimeError(f"CP split count differs across ranks: {splits}")
+    if rank == 0:
+        print(f"[attn_cp] CP splits={splits[0]}", flush=True)
 
 
 class FullAttnCP:
@@ -89,6 +104,10 @@ class FullAttnCP:
         self.megatl = ctypes.CDLL(str(build_cp("nex_n2_5_pro_cp_hopper_mega_ctypes")))
         self.megatl.NexN25ProCpAttnMegaDynLaunch.argtypes = [vp] * 9 + [ci] * 2 + [cu] + [vp] * 4
         self.megatl.NexN25ProCpAttnMegaDynLaunch.restype = ci
+        self.megatl.NexN25ProCpAttnMegaNumSplits.argtypes = []
+        self.megatl.NexN25ProCpAttnMegaNumSplits.restype = ci
+        if share_cp is None:  # first CP block only: one start-time check per process
+            _check_num_splits(self.megatl, rank, world, dev)
         self.tll = ctypes.CDLL(str(build_cp("nex_n2_5_pro_cp_tail_ctypes")))
         self.tll.NexN25ProCpTailLaunch.argtypes = [vp] * 12 + [ci] * 4 + [vp]
         self.opl = ctypes.CDLL(str(build("nex_n2_5_pro_o_proj_reduce_ctypes")))
