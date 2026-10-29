@@ -16,9 +16,9 @@
 """H20 geometry of the MoE gate/up, GDN front and CP front kernels: bitwise equal to the released one.
 
 Each kernel has a second launch entry with an `int geometry` argument. Geometry 0 runs the released
-grid. Geometry 1 runs the H20 grid, which gives each thread block more rows, so that the grid fits one
-round of thread blocks on a GPU with 78 SMs. Both geometries compute each output row with the same
-operations in the same order. So on the same random inputs they must give the same bits, and so must
+grid. Geometry 1 runs the H20 grid, which gives each thread block more rows, so that the grid needs
+fewer rounds of thread blocks on a GPU with 78 SMs. Both geometries compute each output row with the
+same operations in the same order. So on the same random inputs they must give the same bits, and so must
 the released entry point, which selects the geometry by itself.
 
 NEXRT_H20_GEOMETRY forces the selection: unset or empty selects geometry 1 when the GPU has fewer than
