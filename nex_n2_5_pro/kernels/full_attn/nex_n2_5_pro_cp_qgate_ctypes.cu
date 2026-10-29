@@ -98,6 +98,12 @@ constexpr int kH20RowsPerCTA = 5;
 constexpr int kSplitK = 8;
 constexpr int kNumScaleBlocks = kDupQOnlyRows / 128;
 
+// CTAs per 128-row scale block for a given number of rows per CTA. The kernel maps its CTAs with it,
+// and the grid of the launch (launch_rows) comes from it, so the two cannot disagree.
+__host__ __device__ constexpr int groups_per_scale_block(int rows_per_cta) {
+    return (128 + rows_per_cta - 1) / rows_per_cta;
+}
+
 template <int kRowsPerCTA>
 __global__ __launch_bounds__(256) void DupQOnlyGroupSplitKKernel(
     const __nv_bfloat16* __restrict__ x, const __nv_fp8_e4m3* __restrict__ W,
@@ -106,7 +112,7 @@ __global__ __launch_bounds__(256) void DupQOnlyGroupSplitKKernel(
     __nv_bfloat16* __restrict__ v_cache, int pos,
     const int* __restrict__ slot) {  // device-S: pos = slot[1] (null -> host pos)
     if (slot) pos = slot[1];
-    constexpr int kGroupsPerScaleBlock = (128 + kRowsPerCTA - 1) / kRowsPerCTA;
+    constexpr int kGroupsPerScaleBlock = groups_per_scale_block(kRowsPerCTA);
     constexpr int kLinesPerRow = 4;
     static_assert(kRowsPerCTA * kLinesPerRow <= 32, "one prefetch lane per line");
     __shared__ float partials[kRowsPerCTA][kSplitK];
@@ -173,24 +179,33 @@ __global__ __launch_bounds__(256) void DupQOnlyGroupSplitKKernel(
     }
 }
 
-// Geometry 0 launches the released grid (3 rows per CTA), geometry 1 the H20 grid. Other values
-// return cudaErrorInvalidValue without a launch.
-int launch_dup_qonly_group_splitk(const void* x, const void* W, const float* scales, void* q_group,
-                                  void* gate_out, void* k_cache, void* v_cache, int pos,
-                                  const int* slot, int geometry, void* stream) {
-    if (geometry != 0 && geometry != 1) {
-        return static_cast<int>(cudaErrorInvalidValue);
-    }
-    const int rows = geometry == 0 ? kReleasedRowsPerCTA : kH20RowsPerCTA;
-    const auto kernel = geometry == 0 ? &DupQOnlyGroupSplitKKernel<kReleasedRowsPerCTA>
-                                      : &DupQOnlyGroupSplitKKernel<kH20RowsPerCTA>;
-    kernel<<<kNumScaleBlocks * ((128 + rows - 1) / rows), 256, 0,
-             reinterpret_cast<cudaStream_t>(stream)>>>(
+// One kernel instantiation and its grid, both from kRowsPerCTA.
+template <int kRowsPerCTA>
+int launch_rows(const void* x, const void* W, const float* scales, void* q_group, void* gate_out,
+                void* k_cache, void* v_cache, int pos, const int* slot, void* stream) {
+    DupQOnlyGroupSplitKKernel<kRowsPerCTA><<<kNumScaleBlocks * groups_per_scale_block(kRowsPerCTA),
+                                             256, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
         reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const __nv_fp8_e4m3*>(W),
         scales, reinterpret_cast<__nv_bfloat16*>(q_group),
         reinterpret_cast<__nv_bfloat16*>(gate_out), reinterpret_cast<__nv_bfloat16*>(k_cache),
         reinterpret_cast<__nv_bfloat16*>(v_cache), pos, slot);
     return static_cast<int>(cudaGetLastError());
+}
+
+// Geometry 0 launches the released grid (3 rows per CTA), geometry 1 the H20 grid. Other values
+// return cudaErrorInvalidValue without a launch.
+int launch_dup_qonly_group_splitk(const void* x, const void* W, const float* scales, void* q_group,
+                                  void* gate_out, void* k_cache, void* v_cache, int pos,
+                                  const int* slot, int geometry, void* stream) {
+    if (geometry == 0) {
+        return launch_rows<kReleasedRowsPerCTA>(x, W, scales, q_group, gate_out, k_cache, v_cache,
+                                                pos, slot, stream);
+    }
+    if (geometry == 1) {
+        return launch_rows<kH20RowsPerCTA>(x, W, scales, q_group, gate_out, k_cache, v_cache, pos,
+                                           slot, stream);
+    }
+    return static_cast<int>(cudaErrorInvalidValue);
 }
 
 }  // namespace nexrt::sm90::nex_n2_5_pro::NEXRT_NEX_N2_5_PRO_KERNEL_FAMILY
