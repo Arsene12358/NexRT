@@ -108,6 +108,14 @@ class FullAttnCP:
         self.megatl.NexN25ProCpAttnMegaNumSplits.restype = ci
         if share_cp is None:  # first CP block only: one start-time check per process
             _check_num_splits(self.megatl, rank, world, dev)
+            geometry = self.qgl.NexN25ProCpQGateGeometry()  # per device, local data only
+            if geometry not in (0, 1):
+                raise RuntimeError(
+                    f"invalid CP front geometry {geometry} (a negative CUDA error code). "
+                    "NEXRT_H20_GEOMETRY must be unset, empty, 0 or 1."
+                )
+            if rank == 0:
+                print(f"[attn_cp] CP front geometry={geometry}", flush=True)
         self.tll = ctypes.CDLL(str(build_cp("nex_n2_5_pro_cp_tail_ctypes")))
         self.tll.NexN25ProCpTailLaunch.argtypes = [vp] * 12 + [ci] * 4 + [vp]
         self.opl = ctypes.CDLL(str(build("nex_n2_5_pro_o_proj_reduce_ctypes")))

@@ -1,5 +1,5 @@
 // Copyright (c) Nex-AGI. All rights reserved.
-//
+// Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -22,6 +22,8 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+
+#include "../common/h20_geometry.cuh"
 
 namespace nexrt::sm90::nex_n2_5_pro::NEXRT_NEX_N2_5_PRO_KERNEL_FAMILY {
 constexpr int kHid = 4096;
@@ -61,6 +63,9 @@ __device__ __forceinline__ void scatter_dup_qonly_row(
 
 // Three rows per CTA, split-K8, streaming weights, L2 prefetch, FP32 lane-dot.
 // Apply the QKV projection scheme to the 5632-row duplicated-Q projection.
+// The H20 geometry gives each CTA more rows, so that the grid needs fewer rounds of CTAs on a GPU
+// with fewer SMs (H20: 78). The row count changes only which CTA computes a row: each row keeps
+// its lanes, its warp sums and the fixed-order sum of its 8 split partials.
 
 // The residual input is BF16 and is normalized downstream. Keep both the
 // activation conversion and lane accumulation in FP32 to avoid FP16 overflow.
@@ -85,11 +90,15 @@ __device__ __forceinline__ uint2 load_weight_cs(const void* ptr) {
     return v;
 }
 
-constexpr int kRowsPerCTA = 3;
+constexpr int kReleasedRowsPerCTA = 3;
+// H20: 26 CTAs per scale block, 1144 CTAs, 3 rounds on 78 SMs at 6 CTAs per SM (the released 1892
+// CTAs need 5). Measured on H20: 9.96 us per launch, against 10.07 us with 6 rows, 10.42 us with
+// 7 rows, 10.53 us with 4 rows and 11.03 us for the released geometry.
+constexpr int kH20RowsPerCTA = 5;
 constexpr int kSplitK = 8;
-constexpr int kGroupsPerScaleBlock = (128 + kRowsPerCTA - 1) / kRowsPerCTA;
 constexpr int kNumScaleBlocks = kDupQOnlyRows / 128;
 
+template <int kRowsPerCTA>
 __global__ __launch_bounds__(256) void DupQOnlyGroupSplitKKernel(
     const __nv_bfloat16* __restrict__ x, const __nv_fp8_e4m3* __restrict__ W,
     const float* __restrict__ scales, __nv_bfloat16* __restrict__ q_group,
@@ -97,7 +106,9 @@ __global__ __launch_bounds__(256) void DupQOnlyGroupSplitKKernel(
     __nv_bfloat16* __restrict__ v_cache, int pos,
     const int* __restrict__ slot) {  // device-S: pos = slot[1] (null -> host pos)
     if (slot) pos = slot[1];
+    constexpr int kGroupsPerScaleBlock = (128 + kRowsPerCTA - 1) / kRowsPerCTA;
     constexpr int kLinesPerRow = 4;
+    static_assert(kRowsPerCTA * kLinesPerRow <= 32, "one prefetch lane per line");
     __shared__ float partials[kRowsPerCTA][kSplitK];
 
     const int split = threadIdx.x >> 5;
@@ -162,11 +173,19 @@ __global__ __launch_bounds__(256) void DupQOnlyGroupSplitKKernel(
     }
 }
 
+// Geometry 0 launches the released grid (3 rows per CTA), geometry 1 the H20 grid. Other values
+// return cudaErrorInvalidValue without a launch.
 int launch_dup_qonly_group_splitk(const void* x, const void* W, const float* scales, void* q_group,
                                   void* gate_out, void* k_cache, void* v_cache, int pos,
-                                  const int* slot, void* stream) {
-    DupQOnlyGroupSplitKKernel<<<kNumScaleBlocks * kGroupsPerScaleBlock, 256, 0,
-                                reinterpret_cast<cudaStream_t>(stream)>>>(
+                                  const int* slot, int geometry, void* stream) {
+    if (geometry != 0 && geometry != 1) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    const int rows = geometry == 0 ? kReleasedRowsPerCTA : kH20RowsPerCTA;
+    const auto kernel = geometry == 0 ? &DupQOnlyGroupSplitKKernel<kReleasedRowsPerCTA>
+                                      : &DupQOnlyGroupSplitKKernel<kH20RowsPerCTA>;
+    kernel<<<kNumScaleBlocks * ((128 + rows - 1) / rows), 256, 0,
+             reinterpret_cast<cudaStream_t>(stream)>>>(
         reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const __nv_fp8_e4m3*>(W),
         scales, reinterpret_cast<__nv_bfloat16*>(q_group),
         reinterpret_cast<__nv_bfloat16*>(gate_out), reinterpret_cast<__nv_bfloat16*>(k_cache),
@@ -176,20 +195,46 @@ int launch_dup_qonly_group_splitk(const void* x, const void* W, const float* sca
 
 }  // namespace nexrt::sm90::nex_n2_5_pro::NEXRT_NEX_N2_5_PRO_KERNEL_FAMILY
 using namespace nexrt::sm90::nex_n2_5_pro::NEXRT_NEX_N2_5_PRO_KERNEL_FAMILY;
+// The geometry of the two launchers below follows the device and NEXRT_H20_GEOMETRY
+// (h20_geometry.cuh).
 extern "C" int NexN25ProCpQGateLaunch(const void* x, const void* W, const float* scales,
                                       void* q_group, void* gate_out, void* k_cache, void* v_cache,
                                       int pos, void* stream) {
+    const int geometry = h20_geometry();
+    if (geometry < 0) return -geometry;
     return launch_dup_qonly_group_splitk(x, W, scales, q_group, gate_out, k_cache, v_cache, pos,
-                                         nullptr, stream);
+                                         nullptr, geometry, stream);
 }
 
 // device-S: pos from slot[1] (for the growing-S decode graph).
 extern "C" int NexN25ProCpQGateDynLaunch(const void* x, const void* W, const float* scales,
                                          void* q_group, void* gate_out, void* k_cache,
                                          void* v_cache, const void* slot, void* stream) {
+    const int geometry = h20_geometry();
+    if (geometry < 0) return -geometry;
     return launch_dup_qonly_group_splitk(x, W, scales, q_group, gate_out, k_cache, v_cache, 0,
-                                         reinterpret_cast<const int*>(slot), stream);
+                                         reinterpret_cast<const int*>(slot), geometry, stream);
 }
+
+// The two launchers above with an explicit geometry: 0 = released, 1 = H20.
+extern "C" int NexN25ProCpQGateLaunchGeometry(const void* x, const void* W, const float* scales,
+                                              void* q_group, void* gate_out, void* k_cache,
+                                              void* v_cache, int pos, int geometry, void* stream) {
+    return launch_dup_qonly_group_splitk(x, W, scales, q_group, gate_out, k_cache, v_cache, pos,
+                                         nullptr, geometry, stream);
+}
+
+extern "C" int NexN25ProCpQGateDynLaunchGeometry(const void* x, const void* W, const float* scales,
+                                                 void* q_group, void* gate_out, void* k_cache,
+                                                 void* v_cache, const void* slot, int geometry,
+                                                 void* stream) {
+    return launch_dup_qonly_group_splitk(x, W, scales, q_group, gate_out, k_cache, v_cache, 0,
+                                         reinterpret_cast<const int*>(slot), geometry, stream);
+}
+
+// The geometry that the two automatic launchers select on the current device: 0 or 1, or a
+// negative CUDA error code.
+extern "C" int NexN25ProCpQGateGeometry() { return h20_geometry(); }
 
 extern "C" const char* NexN25ProCpQGateErrorString(int code) {
     return cudaGetErrorString(static_cast<cudaError_t>(code));
