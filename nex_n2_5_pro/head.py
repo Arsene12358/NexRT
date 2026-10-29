@@ -71,9 +71,12 @@ def lmhead_geometry(lib):
     ranks need not agree. An invalid NEXRT_H20_GEOMETRY makes every launch fail: stop at start."""
     geometry = lib.NexN25ProLmHeadGemvGeometry()
     if geometry not in (0, 1):
+        decode = lib.NexN25ProLmHeadCudaErrorString
+        decode.argtypes, decode.restype = [ctypes.c_int], ctypes.c_char_p
         raise RuntimeError(
-            f"invalid LM head geometry {geometry}. A negative value is a CUDA error code. "
-            "NEXRT_H20_GEOMETRY must be unset, empty, 0 or 1."
+            f"LM head geometry query failed with CUDA error {-geometry} "
+            f"({decode(-geometry).decode()}). An invalid NEXRT_H20_GEOMETRY gives "
+            "'invalid argument'. It must be unset, empty, 0 or 1."
         )
     return geometry
 

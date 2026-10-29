@@ -185,10 +185,10 @@ inline int LaunchGeometry(const void* h, const void* Wf, void* logits, float* in
     return static_cast<int>(cudaErrorInvalidValue);
 }
 
-// Geometry selection: 1 on devices with fewer than 128 SMs (H20: 78), else 0 (H100 and H200: 132).
-// NEXRT_H20_GEOMETRY=0 or =1 overrides it, unset or empty selects automatically, and any other value
-// is an error. Errors return a negative CUDA error code. The kernel reads only this rank's shard, so
-// ranks need not agree.
+// Geometry selection: 1 on devices with fewer than 128 SMs (H20: 78), else 0 (H100 SXM and
+// H200: 132). NEXRT_H20_GEOMETRY=0 or =1 overrides it, unset or empty selects automatically, and
+// any other value is an error. Errors return a negative CUDA error code. The kernel reads only this
+// rank's shard, so ranks need not agree.
 inline int query_lmhead_geometry(int device) {
     const char* env = std::getenv("NEXRT_H20_GEOMETRY");
     if (env != nullptr && env[0] != '\0') {

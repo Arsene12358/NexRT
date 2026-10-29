@@ -112,6 +112,24 @@ def test_h20_geometry_matches_released_bitwise(lib, seed, h_scale, w_scale, wide
 
 
 @needs_gpu
+def test_inv_rms_matches_released_bitwise(lib):
+    """16 more h vectors for the CTA-0 variance reduce, one launch per geometry each."""
+    device = torch.device("cuda", 0)
+    gen = torch.Generator(device=device).manual_seed(4)
+    W = (torch.randn(ROWS, DIM, generator=gen, device=device) * 0.02).to(torch.bfloat16)
+    for i in range(16):
+        h = torch.randn(DIM, generator=gen, device=device) * 2.0 ** (i - 8)
+        if i % 2:  # magnitudes spread over many binades
+            h *= torch.exp2(torch.randn(DIM, generator=gen, device=device) * 4)
+        h = h.to(torch.bfloat16)
+        rc0, logits0, inv0 = run(lib.NexN25ProLmHeadGemvLaunchGeometry, h, W, 0)
+        rc1, logits1, inv1 = run(lib.NexN25ProLmHeadGemvLaunchGeometry, h, W, 1)
+        assert (rc0, rc1) == (0, 0) and torch.isfinite(inv0).all(), i
+        assert torch.equal(inv1.view(torch.int32), inv0.view(torch.int32)), i
+        assert torch.equal(logits1.view(torch.int32), logits0.view(torch.int32)), i
+
+
+@needs_gpu
 def test_other_geometry_values_are_refused(lib):
     device = torch.device("cuda", 0)
     h = torch.ones(DIM, dtype=torch.bfloat16, device=device)
@@ -175,6 +193,7 @@ def test_environment_selects_the_geometry(value):
     assert names0 != names1
     if value in ("2", "h20"):
         assert report["geometry"] < 0
+        assert "(invalid argument)" in str(report["head_check"])  # the decoded CUDA error
         assert "NEXRT_H20_GEOMETRY" in str(report["head_check"])
         rc, names = report["entry"]
         assert rc != 0 and names == []  # the released entry refuses and launches nothing
@@ -183,3 +202,27 @@ def test_environment_selects_the_geometry(value):
         assert report["geometry"] == expected
         assert report["head_check"] == expected
         assert report["entry"] == [0, names1 if expected else names0]
+
+
+@needs_gpu
+def test_failed_query_reads_differently():
+    """Without a visible GPU the query fails in cudaGetDevice, and head.py names that error."""
+    env = {k: v for k, v in os.environ.items() if k != "NEXRT_H20_GEOMETRY"}
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    code = (
+        "from nex_n2_5_pro.head import lmhead_geometry\n"
+        "from nex_n2_5_pro.tests.test_h20_lmhead_geometry import load_library\n"
+        "try:\n    print(lmhead_geometry(load_library()))\n"
+        "except RuntimeError as err:\n    print(err)\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert out.returncode == 0, out.stderr[-4000:]
+    assert "failed with CUDA error" in out.stdout, out.stdout
+    assert "(invalid argument)" not in out.stdout, out.stdout
