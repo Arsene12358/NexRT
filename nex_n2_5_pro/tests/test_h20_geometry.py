@@ -23,7 +23,9 @@ the released entry point, which selects the geometry by itself.
 
 NEXRT_H20_GEOMETRY forces the selection: unset or empty selects geometry 1 when the GPU has fewer than
 128 SMs and geometry 0 otherwise, 0 or 1 forces that geometry, and any other value is an error. The
-test checks the selection under the value that it runs with, and an invalid value in a child process.
+test checks the selection under the value that it runs with: the queries return it, and torch.profiler
+shows that each automatic entry launched the kernel of that geometry. A child process checks an
+invalid value.
 
 No model weights required. Run on one GPU from the repository root:
     python3 -m nex_n2_5_pro.tests.test_h20_geometry
@@ -37,6 +39,7 @@ import sys
 from pathlib import Path
 
 import torch
+from torch.profiler import ProfilerActivity, profile
 
 from nex_n2_5_pro.kernel_build import build_kernel
 
@@ -86,7 +89,8 @@ def bits(t):
 
 
 def fp8_weights(gen, *shape):
-    """Random FP8 weights over the whole E4M3 range (no NaN), made in slices of 64 rows."""
+    """Random FP8 weights over the whole E4M3 range (no NaN). They are made in slices of 64 * 256 =
+    16,384 rows, so that the FP32 temporary stays at 256 MiB."""
     w = torch.empty(*shape, dtype=FP8, device="cuda")
     flat = w.view(-1, shape[-1])
     for i in range(0, flat.shape[0], 64 * 256):
@@ -128,6 +132,27 @@ def run_three_ways(name, launch, outputs):
             )
 
 
+def launched_kernels(fn):
+    """Run fn under torch.profiler. Return its rc and the sorted names of the CUDA kernels it ran."""
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        rc = fn()
+        torch.cuda.synchronize()
+    return rc, sorted(evt.key for evt in prof.key_averages() if evt.self_device_time_total > 0)
+
+
+def check_launched_geometry(name, launch, want):
+    """The automatic entry must run the kernel of the selected geometry (want). The geometries are
+    different template instantiations, so their kernel names differ in the template arguments."""
+    runs = {g: launched_kernels(lambda g=g: launch(g)) for g in (0, 1, None)}
+    for g, (rc, names) in runs.items():
+        assert rc == 0 and len(names) == 1, f"{name}: geometry {g} returned {rc}, ran {names}"
+    assert runs[0][1] != runs[1][1], f"{name}: both geometries ran {runs[0][1]}"
+    assert runs[None][1] == runs[want][1], (
+        f"{name}: the automatic entry ran {runs[None][1]}, geometry {want} runs {runs[want][1]}"
+    )
+    return runs[want][1][0].split("(")[0].split("::")[-1]
+
+
 def check_rejects_geometry_2(name, launch, outputs):
     """An explicit geometry other than 0 or 1 returns cudaErrorInvalidValue and launches nothing."""
     for t in outputs():
@@ -140,7 +165,7 @@ def check_rejects_geometry_2(name, launch, outputs):
         assert torch.equal(bits(a), bits(b)), f"{name}: geometry 2 wrote an output"
 
 
-def test_gate_up(lib, gen):
+def check_gate_up(lib, gen, want):
     explicit = lib.NexN25ProL1W13XnLaunchGeometry
     explicit.argtypes, explicit.restype = [VP] * 7 + [CI, VP], CI
     auto = lib.NexN25ProL1W13XnLaunch
@@ -165,10 +190,15 @@ def test_gate_up(lib, gen):
 
         run_three_ways("gate/up", launch, lambda: [raw_h])
     check_rejects_geometry_2("gate/up", launch, lambda: [raw_h])
-    print(f"PASS gate/up: {len(SEEDS)} seeds, geometry 0 == geometry 1 == automatic", flush=True)
+    kernel = check_launched_geometry("gate/up", launch, want)
+    print(
+        f"PASS gate/up: {len(SEEDS)} seeds, geometry 0 == geometry 1 == automatic, "
+        f"the automatic entry ran {kernel}",
+        flush=True,
+    )
 
 
-def test_gdn_front(lib, gen):
+def check_gdn_front(lib, gen, want):
     explicit = lib.NexN25ProLinearFrontLaunchGeometry
     explicit.argtypes, explicit.restype = [VP] * 12 + [CI, VP], CI
     auto = lib.NexN25ProLinearFrontLaunch
@@ -225,13 +255,15 @@ def test_gdn_front(lib, gen):
         lambda geometry: launch(geometry, xs[0]),
         lambda: [state, qkv_out, z_out, beta_out, g_out],
     )
+    kernel = check_launched_geometry("GDN front", lambda geometry: launch(geometry, xs[0]), want)
     print(
-        f"PASS GDN front: {len(SEEDS)} seeds x 3 steps, geometry 0 == geometry 1 == automatic",
+        f"PASS GDN front: {len(SEEDS)} seeds x 3 steps, geometry 0 == geometry 1 == automatic, "
+        f"the automatic entry ran {kernel}",
         flush=True,
     )
 
 
-def test_cp_front(lib, gen):
+def check_cp_front(lib, gen, want):
     fixed_explicit = lib.NexN25ProCpQGateLaunchGeometry
     fixed_explicit.argtypes, fixed_explicit.restype = [VP] * 7 + [CI, CI, VP], CI
     fixed_auto = lib.NexN25ProCpQGateLaunch
@@ -268,9 +300,11 @@ def test_cp_front(lib, gen):
             run_three_ways_cp(f"CP front {form}", launch, outputs, pos)
     check_rejects_geometry_2("CP front fixed", fixed, outputs)
     check_rejects_geometry_2("CP front device-S", dyn, outputs)
+    kernel = check_launched_geometry("CP front fixed", fixed, want)
+    assert check_launched_geometry("CP front device-S", dyn, want) == kernel
     print(
         f"PASS CP front: {len(SEEDS)} seeds, fixed and device-S forms, "
-        "geometry 0 == geometry 1 == automatic",
+        f"geometry 0 == geometry 1 == automatic, the automatic entries ran {kernel}",
         flush=True,
     )
 
@@ -323,11 +357,16 @@ print("CODES", codes)
 """
 
 
-def check_selection(libs):
+def expected_geometry():
+    """(geometry that the automatic entries must select, SM count, NEXRT_H20_GEOMETRY)"""
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     env = os.environ.get("NEXRT_H20_GEOMETRY", "")
     assert env in ("", "0", "1"), f"run the test with NEXRT_H20_GEOMETRY unset, 0 or 1, not {env!r}"
-    want = int(env) if env else (1 if sms < 128 else 0)
+    return (int(env) if env else (1 if sms < 128 else 0)), sms, env
+
+
+def check_selection(libs):
+    want, sms, env = expected_geometry()
     for name, lib in libs.items():
         got = lib.query()
         assert got == want, (
@@ -360,9 +399,10 @@ def main():
     libs = {name: load(name) for name in LIBRARIES}
     gen = torch.Generator(device="cuda")
     gen.manual_seed(20261029)
-    test_gate_up(libs["gate/up"], gen)
-    test_gdn_front(libs["GDN front"], gen)
-    test_cp_front(libs["CP front"], gen)
+    want = expected_geometry()[0]
+    check_gate_up(libs["gate/up"], gen, want)
+    check_gdn_front(libs["GDN front"], gen, want)
+    check_cp_front(libs["CP front"], gen, want)
     check_selection(libs)
     print("PASS H20 geometry: 3 kernels bitwise equal in both geometries", flush=True)
 
