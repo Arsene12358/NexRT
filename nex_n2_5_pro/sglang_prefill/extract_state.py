@@ -54,9 +54,9 @@ try:
     from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
     from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.sampling.sampling_params import SamplingParams
-    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.server_args import PortArgs, ServerArgs
+
+    from nex_n2_5_pro.sglang_prefill.bridge import chunked_prefill
 except ImportError as exc:
     _SGLANG_IMPORT_ERROR = exc
 
@@ -210,10 +210,6 @@ class Capture:
 
 
 # ------------------------- prefill (single or chunked) -------------------------
-def _sp():
-    return SamplingParams(temperature=0, max_new_tokens=1)
-
-
 def run_prefill(model_runner, tokens, chunk_size, cap):
     """(Possibly chunked) prefill of `tokens` as ONE continued request. Hooks fire per chunk and accumulate.
     Returns (next_token_ids, next_token_logits, batch)."""
@@ -227,31 +223,9 @@ def run_prefill(model_runner, tokens, chunk_size, cap):
         nti, ntl, batch = B.extend(reqs, model_runner)
         cap.on = False
         return nti, ntl, batch
-    # chunked continued prefill (bounds per-forward memory; GDN pool + KV carry via prefix_indices)
-    req = Req(
-        rid=0,
-        origin_input_text="",
-        origin_input_ids=[int(x) for x in tokens[:chunk_size]],
-        sampling_params=_sp(),
-    )
-    req.fill_ids = [int(x) for x in tokens[:chunk_size]]
-    req.logprob_start_len = -1
-    req.set_extend_input_len(
-        len(req.fill_ids) - len(req.prefix_indices)
-    )  # prefix_indices default (empty tensor)
-    nti, ntl, batch = B.extend([req], model_runner)
-    rp_idx = int(batch.req_pool_indices[0])
-    consumed = chunk_size
-    while consumed < n:
-        e = min(consumed + chunk_size, n)
-        req.fill_ids = [int(x) for x in tokens[:e]]
-        req.prefix_indices = model_runner.req_to_token_pool.req_to_token[rp_idx, :consumed].to(
-            req.prefix_indices.dtype
-        )
-        req.set_extend_input_len(e - consumed)
-        nti, ntl, batch = B.extend([req], model_runner)
-        rp_idx = int(batch.req_pool_indices[0])
-        consumed = e
+    # chunked continued prefill (bounds per-forward memory; GDN pool + KV carry via prefix_indices).
+    # The bridge's driver stages each chunk on either Req API (SGLang 0.5.15 has set_extend_range).
+    nti, ntl, batch = chunked_prefill(model_runner, tokens, chunk_size)
     cap.on = False
     return nti, ntl, batch
 
