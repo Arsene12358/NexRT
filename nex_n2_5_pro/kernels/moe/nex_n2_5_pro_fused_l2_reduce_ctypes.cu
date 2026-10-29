@@ -206,10 +206,18 @@ __global__ __launch_bounds__(512, 1) void FusedL2ReducePushKernel(
     // slot. bar.warp.sync makes thread 0's release cumulative over the lanes' stores.
     if (threadIdx.x < 32) {
         if (threadIdx.x < kGroups * 8) {
-            const int g = threadIdx.x / 8;
-            const int k2 = (threadIdx.x & 7) * 2;
-            const int sm_base = g * kWarpsPerCTA + k2;
-            const int prow = row_base + g * kGroupRows + k2;
+            int sm_base, prow;
+            if constexpr (kNumCTAs == 128) {
+                // The released index form, which keeps the released machine code.
+                const int k2 = (threadIdx.x & 7) * 2;
+                sm_base = (threadIdx.x < 8) ? k2 : 16 + k2;
+                prow = row_base + ((threadIdx.x < 8) ? 0 : (kDim / 2)) + k2;
+            } else {
+                const int g = threadIdx.x / 8;
+                const int k2 = (threadIdx.x & 7) * 2;
+                sm_base = g * kWarpsPerCTA + k2;
+                prow = row_base + g * kGroupRows + k2;
+            }
             const __nv_bfloat162 pk =
                 __floats2bfloat162_rn(block_partials[sm_base], block_partials[sm_base + 1]);
             const unsigned long long slot =
@@ -249,10 +257,18 @@ __global__ __launch_bounds__(512, 1) void FusedL2ReducePushKernel(
     // discarded unicast readback of the multicast-written slot stays alias-safe),
     // and sum in fixed r0..r7 order -- deterministic on every rank.
     if (threadIdx.x < kGroups * 8) {
-        const int g = threadIdx.x / 8;
-        const int k2 = (threadIdx.x & 7) * 2;
-        const int sm_base = g * kWarpsPerCTA + k2;
-        const int prow = row_base + g * kGroupRows + k2;
+        int sm_base, prow;
+        if constexpr (kNumCTAs == 128) {
+            // The released index form, which keeps the released machine code.
+            const int k2 = (threadIdx.x & 7) * 2;
+            sm_base = (threadIdx.x < 8) ? k2 : 16 + k2;
+            prow = row_base + ((threadIdx.x < 8) ? 0 : (kDim / 2)) + k2;
+        } else {
+            const int g = threadIdx.x / 8;
+            const int k2 = (threadIdx.x & 7) * 2;
+            sm_base = g * kWarpsPerCTA + k2;
+            prow = row_base + g * kGroupRows + k2;
+        }
         const unsigned* slot = rep_local + (static_cast<unsigned long long>(parity) * (kDim / 2) +
                                             static_cast<unsigned long long>(prow >> 1)) *
                                                8ull;
