@@ -665,19 +665,30 @@ __global__ __launch_bounds__(kWsThreads, 1) void Raw16HopperWsStageSwitchPublish
 
     constexpr int kCombineWarps = 8;
     constexpr int kCombineDBlocks = kHeadDim / 32;
-    constexpr int kCombineUnits = kHeads * kCombineDBlocks;
-    extern __shared__ __align__(1024) char smem[];
-    // One (head, D block) unit per CTA on the 128-CTA grid; a 64-CTA grid takes two units per CTA.
-    for (int unit = static_cast<int>(blockIdx.x); unit < kCombineUnits;
-         unit += static_cast<int>(gridDim.x)) {
-        if (unit != static_cast<int>(blockIdx.x)) {
-            __syncthreads();  // the units reuse the same shared memory
-        }
-        const int dblock = unit & (kCombineDBlocks - 1);
-        const int head = unit / kCombineDBlocks;
+    if constexpr (NumSplit == kNumSplit128) {
+        // 128-CTA grid (H100, H200): the released combine, one (head, D block) unit per CTA. A unit
+        // loop here changes how the compiler unrolls the combine loads and slows the kernel down.
+        const int dblock = static_cast<int>(blockIdx.x) & (kCombineDBlocks - 1);
+        const int head = static_cast<int>(blockIdx.x) / kCombineDBlocks;
+        extern __shared__ __align__(1024) char smem[];
         Raw16LocalCombineBody<kCombineWarps, true>(op, glse, NumSplit, cp_ctx_partial,
                                                    cp_lse_partial, dblock, head,
                                                    reinterpret_cast<float*>(smem));
+    } else {
+        // 64-CTA grid (H20): each CTA takes two (head, D block) units.
+        constexpr int kCombineUnits = kHeads * kCombineDBlocks;
+        extern __shared__ __align__(1024) char smem[];
+        for (int unit = static_cast<int>(blockIdx.x); unit < kCombineUnits;
+             unit += static_cast<int>(gridDim.x)) {
+            if (unit != static_cast<int>(blockIdx.x)) {
+                __syncthreads();  // the units reuse the same shared memory
+            }
+            const int dblock = unit & (kCombineDBlocks - 1);
+            const int head = unit / kCombineDBlocks;
+            Raw16LocalCombineBody<kCombineWarps, true>(op, glse, NumSplit, cp_ctx_partial,
+                                                       cp_lse_partial, dblock, head,
+                                                       reinterpret_cast<float*>(smem));
+        }
     }
 
     grid_bar_sync_modern(grid_counter, NumSplit);
