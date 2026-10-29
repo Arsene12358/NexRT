@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) Nex-AGI. All rights reserved.
-#
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -20,6 +20,8 @@ Offline ModelRunner path (reuses sglang.bench_one_batch load_model/extend). Per 
     RadixAttention pre-hook captures v + SGLang's POST-rope k. k_cache is rebuilt with nexrt's OWN
     partial_rope (convention-safe; RoPE is a forward rotation we re-apply). Accumulated PER CHUNK so
     L > chunked prefill still rebuilds a contiguous [1, L, 256] per layer.
+    SGLang 0.5.15 fuses Qwen3.5's qk-norm + RoPE into one kernel and never calls rotary_emb. There the
+    same PRE-rope k comes from the layer's qkv_proj output through its k_norm, positions from the layer.
   - GDN layers: read the mamba pool after prefill -> conv[0][slot] (conv [1536,3]) + temporal[slot]
     (recurrent [8,128,128], TRANSPOSED [V,K]->[K,V]).
 Also: (A) prints the RoPE re-apply delta (nexrt_rope(kpre) vs SGLang post-rope k) -- must be ~0.
@@ -115,6 +117,28 @@ class Capture:
             self.hooks.append(
                 m.register_forward_pre_hook(self._mk_attn_hook(lid), with_kwargs=True)
             )
+        # SGLang 0.5.15 runs Qwen3.5's qk-norm + RoPE as one kernel (forward_prepare_cuda_fused), so
+        # rotary_emb never runs. For that path: the layer's positions and its qkv_proj k through k_norm.
+        for m in model.modules():
+            a = getattr(m, "attn", None)
+            if isinstance(a, RadixAttention) and a.layer_id in FULL_ATTN and hasattr(m, "k_norm"):
+                self.hooks.append(m.register_forward_pre_hook(self._layer_hook, with_kwargs=True))
+                self.hooks.append(m.qkv_proj.register_forward_hook(self._mk_qkv_hook(m)))
+
+    def _layer_hook(self, mod, args, kwargs):
+        if self.on:  # a full-attn layer starts: drop the previous layer's values
+            self.pending = {"layer_pos": kwargs.get("positions", args[0] if args else None)}
+
+    def _mk_qkv_hook(self, layer):
+        def hook(mod, args, out):
+            if not self.on:
+                return
+            qkv = out[0] if isinstance(out, tuple) else out  # [Lc, q (+gate) | k | v]
+            n, kv = qkv.shape[-1], layer.kv_size
+            k = qkv[:, n - 2 * kv : n - kv].reshape(-1, layer.head_dim)
+            self.pending["layer_kpre"] = layer.k_norm(k).reshape(qkv.shape[0], kv)
+
+        return hook
 
     def _rope_hook(self, mod, args, kwargs):
         if not self.on:
@@ -133,6 +157,8 @@ class Capture:
             v = kwargs.get("v", args[2] if len(args) > 2 else None)
             pos = self.pending.get("pos")
             kpre = self.pending.get("kpre")
+            if kpre is None:  # fused qk-norm + RoPE: rotary_emb did not run for this layer
+                pos, kpre = self.pending.get("layer_pos"), self.pending.get("layer_kpre")
             if v is None or pos is None or kpre is None:
                 return
             self.attn_calls[lid] += 1
