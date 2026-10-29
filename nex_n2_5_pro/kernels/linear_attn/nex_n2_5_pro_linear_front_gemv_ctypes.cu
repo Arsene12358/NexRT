@@ -253,7 +253,10 @@ __global__ __launch_bounds__(128, 9) void LinearFrontSplitCtaSk4Kernel<kH20Fp8CT
     const int warp_in_cta = threadIdx.x >> 5;
 
     if (blockIdx.x < (kBRows + kARows)) {
-        // The released b/a CTAs, unchanged.
+        // A copy of the released b/a branch (lines 107-162 of the primary template), on purpose:
+        // this specialization needs its own body for its __launch_bounds__, and a shared helper
+        // would change the released kernel's source and machine code (ruling R24).
+        // test_h20_geometry.py compares beta_out and g_out of both geometries bit for bit.
         const int actual = blockIdx.x;
         const bool is_b = actual < kBRows;
         const int row = is_b ? actual : (actual - kBRows);
