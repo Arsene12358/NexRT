@@ -16,8 +16,10 @@
 """TP8 FusedL2 reduce: the 64-block variant matches the 128-block variant bit for bit.
 
 Both variants run through NexN25ProFusedL2ReduceResidLaunchCtas, in the plain form (x_resid NULL,
-fp32 out) and the fused-residual form, under three arrival skews. A captured 64-block launch then
-replays 10,000 times with alternating inputs, and the per-block epochs must advance by 10,000.
+fp32 out), the fused-residual form, and the fused-residual form with the wait-shadow prefetch that
+the decode engine passes (the kWaitPf instantiations), under three arrival skews. A captured
+64-block launch then replays 10,000 times with alternating inputs, and the per-block epochs must
+advance by 10,000.
 
 No model weights required. Run on the GPU host from the repository root:
     torchrun --standalone --nproc_per_node=8 -m nex_n2_5_pro.tests.test_fused_l2_ctas
@@ -36,6 +38,7 @@ from nex_n2_5_pro.kernel_build import build_kernel
 DIM, N_EXP, TOPK, RINTER = 4096, 512, 10, 128
 FP8 = torch.float8_e4m3fn
 REPLAYS = 10_000
+PF_BYTES = 4 << 20  # the decode engine clamps the next layer's prefetch range to 4 MiB
 
 
 def main():
@@ -107,9 +110,9 @@ def main():
             ptr(it_ctr),
             rank,
             world,
-            ptr(resid) if form == "resid" else None,
-            None,
-            0,
+            ptr(resid) if form != "plain" else None,
+            ptr(W2) if form == "resid_pf" else None,
+            PF_BYTES if form == "resid_pf" else 0,
             ctas,
             vp(torch.cuda.current_stream().cuda_stream),
         )
@@ -126,7 +129,7 @@ def main():
         # The variants map row pairs to different blocks, so the per-block parity does not keep
         # consecutive launches of different variants apart. Every rank finishes first.
         dist.barrier()
-        return (resid if form == "resid" else out).clone()
+        return (out if form == "plain" else resid).clone()
 
     def all_ranks_bitwise_equal(tensor):
         gathered = [torch.empty_like(tensor) for _ in range(world)]
@@ -148,7 +151,7 @@ def main():
     check(f"{ctas} blocks at one block per SM on {sm} SMs", ctas <= sm)
 
     first = {}
-    for form in ("plain", "resid"):
+    for form in ("plain", "resid", "resid_pf"):
         for skew in (0, 3, 7):
             a, b = run(form, 128, skew), run(form, 64, skew)
             tag = f"{form} skew {skew}"
@@ -181,6 +184,10 @@ def main():
     check(
         "resid equals bf16(x0 + plain)",
         torch.equal(resid_out, (x0.float() + plain_out).to(torch.bfloat16)),
+    )
+    check(
+        "resid with prefetch equals resid",
+        torch.equal(first["resid_pf"].view(torch.uint8), resid_out.view(torch.uint8)),
     )
 
     # Graph: capture the 64-block plain launch once and replay it 10,000 times. The input
@@ -218,7 +225,7 @@ def main():
     failures = int(result.item())
     if rank == 0:
         print(
-            f"FusedL2 CTA variants: automatic {ctas} on {sm} SMs, 12 eager runs, relL2 {rel:.3e}, "
+            f"FusedL2 CTA variants: automatic {ctas} on {sm} SMs, 18 eager runs, relL2 {rel:.3e}, "
             f"{REPLAYS} graph replays, failures={failures}",
             flush=True,
         )
