@@ -1,5 +1,5 @@
 // Copyright (c) Nex-AGI. All rights reserved.
-//
+// Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -20,6 +20,8 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cstdint>
+
+#include "../common/h20_geometry.cuh"
 
 namespace nexrt::sm90::nex_n2_5_pro::NEXRT_NEX_N2_5_PRO_KERNEL_FAMILY {
 constexpr int kDim = 4096;
@@ -195,7 +197,9 @@ __device__ __forceinline__ void resolve_row_w13(
     }
 }
 
-template <int kNumWarps>
+// kItemsPerBlock 1 is the released geometry. The H20 geometry (kItemsPerBlock 2) is the explicit
+// specialization below.
+template <int kNumWarps, int kItemsPerBlock = 1>
 __global__
 __launch_bounds__(kNumWarps * 32) void L1K2PairPacked64UnweightedXbf16V4SplitKW13XnKernel(
     const int32_t* __restrict__ packed_topk64, const __nv_bfloat16* __restrict__ xn,
@@ -252,6 +256,122 @@ __launch_bounds__(kNumWarps * 32) void L1K2PairPacked64UnweightedXbf16V4SplitKW1
         raw_h[item] = silu(gate_sum) * up_sum * rw;
     }
 }
+
+// H20 geometry: each block computes kH20ItemsPerBlock consecutive items with the same four warps.
+// The grid of kAllRows / 2 = 704 blocks fits one round on 78 SMs at 10 blocks per SM, where the
+// released 1408 blocks need a partial second round. The items of a block are rows of one expert,
+// so they share the scales, the route marker and the xn loads. Each item keeps the released
+// arithmetic: the per-lane K loop of dot_pair_xbf16_fp8_v4, the same warp sum and the same
+// pairwise tree. The K loop is fully unrolled (measured on H20: 6.46 us per launch, against 6.72 us
+// with the two-step unroll of the released loop and 7.78 us for the released geometry).
+constexpr int kH20ItemsPerBlock = 2;
+static_assert(kRowsPerExpert % kH20ItemsPerBlock == 0, "the items of a block share one expert");
+
+template <>
+__global__ __launch_bounds__(128, 10) void L1K2PairPacked64UnweightedXbf16V4SplitKW13XnKernel<
+    4, kH20ItemsPerBlock>(const int32_t* __restrict__ packed_topk64,
+                          const __nv_bfloat16* __restrict__ xn,
+                          const __nv_fp8_e4m3* __restrict__ W13,
+                          const float* __restrict__ w13_scales,
+                          const __nv_fp8_e4m3* __restrict__ shared_gate_up,
+                          const float* __restrict__ shared_scales, float* __restrict__ raw_h) {
+    constexpr int kNumWarps = 4;
+    constexpr int kItems = kH20ItemsPerBlock;
+    constexpr int kChunk = kDim / kNumWarps;
+    constexpr int kSteps = kChunk / 128;  // FP8 scale blocks per warp
+
+    __shared__ float gate_dots[kItems][kNumWarps];
+    __shared__ float up_dots[kItems][kNumWarps];
+
+    const int role = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int item0 = blockIdx.x * kItems;
+    if (item0 >= kAllRows) {
+        return;
+    }
+
+    const __nv_fp8_e4m3* row_w1;
+    const __nv_fp8_e4m3* row_w3;
+    const float* row_s1;
+    const float* row_s3;
+    float route_marker;
+    resolve_row_w13(item0, packed_topk64, W13, w13_scales, shared_gate_up, shared_scales, &row_w1,
+                    &row_w3, &row_s1, &row_s3, &route_marker);
+
+    float gate[kItems] = {};
+    float up[kItems] = {};
+    const int kb0 = (role * kChunk) >> 7;
+#pragma unroll
+    for (int step = 0; step < kSteps; ++step) {
+        const int kb = kb0 + step;
+        const int k = (kb << 7) + lane * 4;
+        const float scale1 = row_s1[kb];
+        const float scale3 = row_s3[kb];
+        const __nv_bfloat162 x01 = *reinterpret_cast<const __nv_bfloat162*>(xn + k);
+        const __nv_bfloat162 x23 = *reinterpret_cast<const __nv_bfloat162*>(xn + k + 2);
+        const float2 x01f = __bfloat1622float2(x01);
+        const float2 x23f = __bfloat1622float2(x23);
+#pragma unroll
+        for (int i = 0; i < kItems; ++i) {
+            const size_t offset = static_cast<size_t>(i) * kDim + k;
+            const __nv_fp8x4_e4m3 w1_4 = *reinterpret_cast<const __nv_fp8x4_e4m3*>(row_w1 + offset);
+            const __nv_fp8x4_e4m3 w3_4 = *reinterpret_cast<const __nv_fp8x4_e4m3*>(row_w3 + offset);
+            const float4 w1f = float4(w1_4);
+            const float4 w3f = float4(w3_4);
+            gate[i] += scale1 * (x01f.x * w1f.x + x01f.y * w1f.y + x23f.x * w1f.z + x23f.y * w1f.w);
+            up[i] += scale3 * (x01f.x * w3f.x + x01f.y * w3f.y + x23f.x * w3f.z + x23f.y * w3f.w);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < kItems; ++i) {
+        gate[i] = warp_sum(gate[i]);
+        up[i] = warp_sum(up[i]);
+    }
+
+    if (lane == 0) {
+#pragma unroll
+        for (int i = 0; i < kItems; ++i) {
+            gate_dots[i][role] = gate[i];  // xn already carries rms * gamma
+            up_dots[i][role] = up[i];
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.x < kItems) {
+        const int i = threadIdx.x;
+        // The released pairwise tree, per item.
+        const float gate01 = gate_dots[i][0] + gate_dots[i][1];
+        const float up01 = up_dots[i][0] + up_dots[i][1];
+        const float gate23 = gate_dots[i][2] + gate_dots[i][3];
+        const float up23 = up_dots[i][2] + up_dots[i][3];
+        const float gate_sum = gate01 + gate23;
+        const float up_sum = up01 + up23;
+        float rw = 1.0f;
+        if (route_marker > 0.0f) {
+            rw = __int_as_float(packed_topk64[63]);
+        }
+        raw_h[item0 + i] = silu(gate_sum) * up_sum * rw;
+    }
+}
+
+// Geometry 0 launches the released grid, geometry 1 the H20 grid. Other values return
+// cudaErrorInvalidValue without a launch.
+inline int launch_l1_w13xn(const int32_t* packed_topk64, const void* xn, const void* W13,
+                           const float* w13_scales, const void* shared_gate_up,
+                           const float* shared_scales, float* raw_h, int geometry, void* stream) {
+    if (geometry != 0 && geometry != 1) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    const auto kernel =
+        geometry == 0 ? &L1K2PairPacked64UnweightedXbf16V4SplitKW13XnKernel<4>
+                      : &L1K2PairPacked64UnweightedXbf16V4SplitKW13XnKernel<4, kH20ItemsPerBlock>;
+    const int blocks = geometry == 0 ? kAllRows : kAllRows / kH20ItemsPerBlock;
+    kernel<<<blocks, 128, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+        packed_topk64, reinterpret_cast<const __nv_bfloat16*>(xn),
+        reinterpret_cast<const __nv_fp8_e4m3*>(W13), w13_scales,
+        reinterpret_cast<const __nv_fp8_e4m3*>(shared_gate_up), shared_scales, raw_h);
+    return static_cast<int>(cudaGetLastError());
+}
 }  // namespace nexrt::sm90::nex_n2_5_pro::NEXRT_NEX_N2_5_PRO_KERNEL_FAMILY
 using namespace nexrt::sm90::nex_n2_5_pro::NEXRT_NEX_N2_5_PRO_KERNEL_FAMILY;
 #ifndef NEXRT_MTP_RUNTIME_ONLY
@@ -271,19 +391,32 @@ extern "C" int NexN25ProL1Launch(const int32_t* packed_topk64, const void* x,
 }
 #endif
 
-// Bridge / raw-weight L1: stacked w13 + original checkpoint scales + pre-normalized xn.
+// Bridge / raw-weight L1: stacked w13 + original checkpoint scales + pre-normalized xn. The
+// geometry follows the device and NEXRT_H20_GEOMETRY (h20_geometry.cuh).
 extern "C" int NexN25ProL1W13XnLaunch(const int32_t* packed_topk64, const void* xn, const void* W13,
                                       const float* w13_scales, const void* shared_gate_up,
                                       const float* shared_scales, float* raw_h, void* stream) {
-    L1K2PairPacked64UnweightedXbf16V4SplitKW13XnKernel<4>
-        <<<kAllRows, 128, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
-            packed_topk64, reinterpret_cast<const __nv_bfloat16*>(xn),
-            reinterpret_cast<const __nv_fp8_e4m3*>(W13), w13_scales,
-            reinterpret_cast<const __nv_fp8_e4m3*>(shared_gate_up), shared_scales, raw_h);
-    return static_cast<int>(cudaGetLastError());
+    const int geometry = h20_geometry();
+    if (geometry < 0) return -geometry;
+    return launch_l1_w13xn(packed_topk64, xn, W13, w13_scales, shared_gate_up, shared_scales, raw_h,
+                           geometry, stream);
 }
 
 #ifndef NEXRT_MTP_RUNTIME_ONLY
+// NexN25ProL1W13XnLaunch with an explicit geometry: 0 = released, 1 = H20.
+extern "C" int NexN25ProL1W13XnLaunchGeometry(const int32_t* packed_topk64, const void* xn,
+                                              const void* W13, const float* w13_scales,
+                                              const void* shared_gate_up,
+                                              const float* shared_scales, float* raw_h,
+                                              int geometry, void* stream) {
+    return launch_l1_w13xn(packed_topk64, xn, W13, w13_scales, shared_gate_up, shared_scales, raw_h,
+                           geometry, stream);
+}
+
+// The geometry that NexN25ProL1W13XnLaunch selects on the current device: 0 or 1, or a negative
+// CUDA error code.
+extern "C" int NexN25ProL1W13XnGeometry() { return h20_geometry(); }
+
 extern "C" const char* nex_n2_5_pro_l1_cuda_error_string(int code) {
     return cudaGetErrorString(static_cast<cudaError_t>(code));
 }

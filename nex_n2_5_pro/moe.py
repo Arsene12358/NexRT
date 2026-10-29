@@ -318,6 +318,15 @@ class Moe:
             ctas = check_uniform_ctas(every.tolist())
             if rank == 0:
                 print(f"[moe] FusedL2 CTAs={ctas}", flush=True)
+            if self.raw:  # the gate/up launcher picks its geometry per device (local data only)
+                geometry = self.l1.NexN25ProL1W13XnGeometry()
+                if geometry not in (0, 1):
+                    raise RuntimeError(
+                        f"invalid gate/up geometry {geometry} (a negative CUDA error code). "
+                        "NEXRT_H20_GEOMETRY must be unset, empty, 0 or 1."
+                    )
+                if rank == 0:
+                    print(f"[moe] gate/up geometry={geometry}", flush=True)
             self.rep, _, self.rep_mc = self._symm(8 * 2 * DIM, torch.float32)
             self.rep.zero_()
             self.bar, _, self.bar_mc = self._symm(128, torch.int32)  # one counter slot per CTA
