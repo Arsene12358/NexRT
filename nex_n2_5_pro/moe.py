@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) Nex-AGI. All rights reserved.
-#
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -216,6 +216,20 @@ def convert_layer_ext(ext, dev):
     }, gamma
 
 
+def check_uniform_ctas(ctas_by_rank: list[int]) -> int:
+    """Return the FusedL2 CTA count that every rank selected (NexN25ProFusedL2ReduceCtas).
+    CTA b of each rank waits for CTA b of every peer, so ranks that launch different grids would
+    hang in the reduce. Raise instead, on every rank, before the first launch."""
+    if any(ctas not in (64, 128) for ctas in ctas_by_rank):
+        raise RuntimeError(
+            f"invalid FusedL2 CTA count (by rank): {ctas_by_rank}. A negative value is a CUDA "
+            "error code. NEXRT_FUSED_L2_CTAS must be unset, 64 or 128."
+        )
+    if len(set(ctas_by_rank)) != 1:
+        raise RuntimeError(f"FusedL2 CTA count differs across ranks: {ctas_by_rank}")
+    return ctas_by_rank[0]
+
+
 class Moe:
     def __init__(self, layer, rank, world, dev, keep_ref=True, share_from=None, ext=None):
         self.rank, self.world, self.dev = rank, world, dev
@@ -247,6 +261,8 @@ class Moe:
         )
         self.fl.NexN25ProFusedL2ReduceErrorString.argtypes = [ci]
         self.fl.NexN25ProFusedL2ReduceErrorString.restype = ctypes.c_char_p
+        self.fl.NexN25ProFusedL2ReduceCtas.argtypes = []
+        self.fl.NexN25ProFusedL2ReduceCtas.restype = ci
         # Wait-shadow prefetch of the NEXT layer's front GEMV weights, issued by the L2
         # kernel while its publish drains and the peer wait spins. The decode engine wires
         # (ptr, bytes) per captured graph -- clamped to what the wait window absorbs;
@@ -293,6 +309,15 @@ class Moe:
         # epochs (monotonic device counters -- parity and spin targets derive from them, so graph
         # replays and layer reuse need no host resets).
         if share_from is None:
+            # The FusedL2 launchers pick 128 or 64 CTAs per device; all ranks must agree.
+            mine = torch.tensor(
+                [self.fl.NexN25ProFusedL2ReduceCtas()], dtype=torch.int32, device=dev
+            )
+            every = torch.empty(world, dtype=torch.int32, device=dev)
+            dist.all_gather_into_tensor(every, mine)
+            ctas = check_uniform_ctas(every.tolist())
+            if rank == 0:
+                print(f"[moe] FusedL2 CTAs={ctas}", flush=True)
             self.rep, _, self.rep_mc = self._symm(8 * 2 * DIM, torch.float32)
             self.rep.zero_()
             self.bar, _, self.bar_mc = self._symm(128, torch.int32)  # one counter slot per CTA

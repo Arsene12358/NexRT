@@ -1,5 +1,5 @@
 // Copyright (c) Nex-AGI. All rights reserved.
-//
+// Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,7 +16,10 @@
 //
 // One kernel per MoE block does the L2 down-projection AND the cross-rank sum:
 //   1. 128 CTAs x 16 warps: each warp computes one stripe row pair (row, row+2048)
-//      of the routed + shared down-projection (fp8 W2, fp32 accumulation).
+//      of the routed + shared down-projection (fp8 W2, fp32 accumulation). Where the
+//      128 CTAs cannot all run at once (H20: 78 SMs), 64 CTAs run instead and each
+//      warp computes four rows 1024 apart. Every row pair keeps its wire slot and its
+//      arithmetic, so both variants give bitwise-identical sums.
 //   2. Push publication: warp 0 packs each row pair to bf16 and multicast-stores
 //      one 4-byte wire slot per rank into every GPU's replicated buffer
 //      (u32[parity][kDim/2 row pairs][8 ranks]); a row pair's 8 rank values are
@@ -26,7 +29,7 @@
 //      counter slot; each CTA spins only on its LOCAL slot. Per-CTA epochs
 //      (it_ctr, monotonic) replace any grid-wide generation broadcast, so the
 //      kernel needs no grid barrier and no host resets (CUDA-graph replay safe).
-//   4. Combine from LOCAL memory: 16 threads fetch one row pair's 32-byte slot
+//   4. Combine from LOCAL memory: 16 threads (32 with 64 CTAs) fetch one row pair's 32-byte slot
 //      group each, PATCH their own rank's value from shared memory (the vector
 //      load does read back the own multicast-written word through unicast, but
 //      that word is discarded before use -- the alias-safety mechanism; no
@@ -46,7 +49,10 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 namespace nexrt::sm90::nex_n2_5_pro::NEXRT_NEX_N2_5_PRO_KERNEL_FAMILY {
 constexpr int kDim = 4096;
@@ -97,7 +103,7 @@ __device__ __forceinline__ void multimem_st_u32_as_f32(unsigned long long mc, un
                  : "memory");
 }
 
-template <bool kWaitPf>
+template <bool kWaitPf, int kNumCTAs>
 __global__ __launch_bounds__(512, 1) void FusedL2ReducePushKernel(
     const int32_t* __restrict__ topk_ids, const float* __restrict__ topk_weights,
     const float* __restrict__ h, const __nv_fp8_e4m3* __restrict__ W2,
@@ -113,12 +119,16 @@ __global__ __launch_bounds__(512, 1) void FusedL2ReducePushKernel(
     __nv_bfloat16* __restrict__ x_resid,  // fused residual: if non-null, x_resid += reduced (bf16, in place)
     const char* __restrict__ pf_base,  // optional: L2-warm this range under the peer wait
     long pf_bytes) {
-    constexpr int kNumCTAs = 128;
     constexpr int kNumThreads = 512;
     constexpr int kWarpsPerCTA = kNumThreads / 32;
     static_assert(kWarpsPerCTA == 16, "selected kernel expects 16 warps/CTA");
+    static_assert(kNumCTAs == 128 || kNumCTAs == 64, "FusedL2 runs 128 or 64 CTAs");
+    // Warp w of CTA b computes rows b * 16 + w + g * kGroupRows for g < kGroups: the released
+    // stripe pair (row, row + 2048) with 128 CTAs, four rows 1024 apart with 64 CTAs.
+    constexpr int kGroups = kDim / (kNumCTAs * kWarpsPerCTA);
+    constexpr int kGroupRows = kDim / kGroups;
 
-    __shared__ __align__(16) float block_partials[32];
+    __shared__ __align__(16) float block_partials[kGroups * kWarpsPerCTA];
     __shared__ uint32_t cta_epoch;
 
     const int local_warp = threadIdx.x >> 5;
@@ -131,17 +141,17 @@ __global__ __launch_bounds__(512, 1) void FusedL2ReducePushKernel(
         cta_epoch = it_ctr[blockIdx.x];
     }
 
-    // Slot-outer / half-inner: per-(lane,half) accumulation order is slot 0..9
-    // then shared, and h4 is loaded once per slot instead of twice.
+    // Slot-outer / group-inner: per-(lane,group) accumulation order is slot 0..9
+    // then shared, and h4 is loaded once per slot instead of once per group.
     {
-        int rows[2];
-        int row_scales[2];
+        int rows[kGroups];
+        int row_scales[kGroups];
 #pragma unroll
-        for (int half = 0; half < 2; ++half) {
-            rows[half] = row_base + local_warp + half * (kDim / 2);
-            row_scales[half] = rows[half] >> 7;
+        for (int g = 0; g < kGroups; ++g) {
+            rows[g] = row_base + local_warp + g * kGroupRows;
+            row_scales[g] = rows[g] >> 7;
         }
-        float lane_acc[2] = {0.0f, 0.0f};
+        float lane_acc[kGroups] = {};
 #pragma unroll
         for (int logical = 0; logical < kTopK; ++logical) {
             const int expert = topk_ids[logical];
@@ -149,26 +159,26 @@ __global__ __launch_bounds__(512, 1) void FusedL2ReducePushKernel(
             const float4 h4 = load_h4(row_h, lane);
             const float tw = topk_weights[logical];
 #pragma unroll
-            for (int half = 0; half < 2; ++half) {
+            for (int g = 0; g < kGroups; ++g) {
                 const __nv_fp8_e4m3* row_w =
-                    W2 + (static_cast<unsigned long long>(expert) * kDim + rows[half]) * kRankInter;
-                const float scale = w2_scales[expert * kScaleBlocks + row_scales[half]];
-                lane_acc[half] += tw * scale * dot_h4_wfp8x4(h4, row_w, lane);
+                    W2 + (static_cast<unsigned long long>(expert) * kDim + rows[g]) * kRankInter;
+                const float scale = w2_scales[expert * kScaleBlocks + row_scales[g]];
+                lane_acc[g] += tw * scale * dot_h4_wfp8x4(h4, row_w, lane);
             }
         }
         const float* shared_h = h + kTopK * kRankInter;
         const float4 shared_h4 = load_h4(shared_h, lane);
 #pragma unroll
-        for (int half = 0; half < 2; ++half) {
+        for (int g = 0; g < kGroups; ++g) {
             const __nv_fp8_e4m3* shared_row_w =
-                shared_W2 + static_cast<unsigned long long>(rows[half]) * kRankInter;
-            lane_acc[half] +=
-                shared_w2_scales[row_scales[half]] * dot_h4_wfp8x4(shared_h4, shared_row_w, lane);
+                shared_W2 + static_cast<unsigned long long>(rows[g]) * kRankInter;
+            lane_acc[g] +=
+                shared_w2_scales[row_scales[g]] * dot_h4_wfp8x4(shared_h4, shared_row_w, lane);
         }
 #pragma unroll
-        for (int half = 0; half < 2; ++half) {
-            const float acc = warp_sum(lane_acc[half]);
-            if (lane == 0) block_partials[half * kWarpsPerCTA + local_warp] = acc;
+        for (int g = 0; g < kGroups; ++g) {
+            const float acc = warp_sum(lane_acc[g]);
+            if (lane == 0) block_partials[g * kWarpsPerCTA + local_warp] = acc;
         }
     }
     __syncthreads();  // publishes block_partials and cta_epoch
@@ -191,14 +201,15 @@ __global__ __launch_bounds__(512, 1) void FusedL2ReducePushKernel(
         }
     }
 
-    // bf16 wire publication: warp 0's lanes 0..15 each pack TWO of this CTA's
-    // rows to bf16 and multicast-store their rank's 4-byte slot. bar.warp.sync
-    // makes thread 0's release cumulative over the lanes' stores.
+    // bf16 wire publication: warp 0's lanes 0..kGroups*8-1 (lane t serves group t / 8)
+    // each pack TWO of this CTA's rows to bf16 and multicast-store their rank's 4-byte
+    // slot. bar.warp.sync makes thread 0's release cumulative over the lanes' stores.
     if (threadIdx.x < 32) {
-        if (threadIdx.x < 16) {
+        if (threadIdx.x < kGroups * 8) {
+            const int g = threadIdx.x / 8;
             const int k2 = (threadIdx.x & 7) * 2;
-            const int sm_base = (threadIdx.x < 8) ? k2 : 16 + k2;
-            const int prow = row_base + ((threadIdx.x < 8) ? 0 : (kDim / 2)) + k2;
+            const int sm_base = g * kWarpsPerCTA + k2;
+            const int prow = row_base + g * kGroupRows + k2;
             const __nv_bfloat162 pk =
                 __floats2bfloat162_rn(block_partials[sm_base], block_partials[sm_base + 1]);
             const unsigned long long slot =
@@ -233,14 +244,15 @@ __global__ __launch_bounds__(512, 1) void FusedL2ReducePushKernel(
     }
     __syncthreads();
 
-    // Combine: 16 threads each fetch ONE row pair's 32-byte slot group (8 ranks
+    // Combine: kGroups * 8 threads each fetch ONE row pair's 32-byte slot group (8 ranks
     // x 2 rows bf16) branch-free, patch their own rank from shared memory (the
     // discarded unicast readback of the multicast-written slot stays alias-safe),
     // and sum in fixed r0..r7 order -- deterministic on every rank.
-    if (threadIdx.x < 16) {
+    if (threadIdx.x < kGroups * 8) {
+        const int g = threadIdx.x / 8;
         const int k2 = (threadIdx.x & 7) * 2;
-        const int sm_base = (threadIdx.x < 8) ? k2 : 16 + k2;
-        const int prow = row_base + ((threadIdx.x < 8) ? 0 : (kDim / 2)) + k2;
+        const int sm_base = g * kWarpsPerCTA + k2;
+        const int prow = row_base + g * kGroupRows + k2;
         const unsigned* slot = rep_local + (static_cast<unsigned long long>(parity) * (kDim / 2) +
                                             static_cast<unsigned long long>(prow >> 1)) *
                                                8ull;
@@ -279,54 +291,84 @@ __global__ __launch_bounds__(512, 1) void FusedL2ReducePushKernel(
     }
 }
 
+// ctas 128 launches the released grid and row mapping, ctas 64 the variant for GPUs where the
+// 128 CTAs cannot all run at once. Other values return cudaErrorInvalidValue without a launch.
 template <bool kWaitPf>
 int launch_fused_push(const int32_t* topk_ids, const float* topk_weights, const float* h,
                       const void* W2, const float* w2_scales, const void* shared_W2,
                       const float* shared_w2_scales, unsigned long long rep_mc,
                       const unsigned* rep_local, unsigned long long bar_mc, int* bar_local,
-                      float* out, int* status, unsigned* it_ctr, int rank, int num_ranks,
+                      float* out, int* status, unsigned* it_ctr, int rank, int num_ranks, int ctas,
                       void* stream, __nv_bfloat16* x_resid = nullptr, const char* pf_base = nullptr,
                       long pf_bytes = 0) {
-    FusedL2ReducePushKernel<kWaitPf><<<128, 512, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+    if (ctas != 128 && ctas != 64) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    const auto kernel = ctas == 128 ? &FusedL2ReducePushKernel<kWaitPf, 128>
+                                    : &FusedL2ReducePushKernel<kWaitPf, 64>;
+    kernel<<<ctas, 512, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
         topk_ids, topk_weights, h, reinterpret_cast<const __nv_fp8_e4m3*>(W2), w2_scales,
         reinterpret_cast<const __nv_fp8_e4m3*>(shared_W2), shared_w2_scales, rep_mc, rep_local,
         bar_mc, bar_local, out, status, it_ctr, rank, num_ranks, x_resid, pf_base, pf_bytes);
     return static_cast<int>(cudaGetLastError());
 }
 
-}  // namespace nexrt::sm90::nex_n2_5_pro::NEXRT_NEX_N2_5_PRO_KERNEL_FAMILY
-using namespace nexrt::sm90::nex_n2_5_pro::NEXRT_NEX_N2_5_PRO_KERNEL_FAMILY;
-#ifndef NEXRT_MTP_RUNTIME_ONLY
-extern "C" int NexN25ProFusedL2ReduceLaunch(const void* topk_ids, const void* topk_weights,
-                                            const void* h, const void* W2, const void* w2_scales,
-                                            const void* shared_W2, const void* shared_w2_scales,
-                                            unsigned long long rep_mc, const void* rep_local,
-                                            unsigned long long bar_mc, void* bar_local, void* out,
-                                            void* status, void* it_ctr, int rank, int num_ranks,
-                                            void* stream) {
-    if (num_ranks <= 0 || num_ranks > kMaxRanks || rep_mc == 0 || bar_mc == 0) {
-        return static_cast<int>(cudaErrorInvalidValue);
+// Grid selection. CTA b waits until CTA b of every rank has arrived, so every CTA must run at
+// once. Otherwise the CTAs of a second round start only when first-round CTAs finish, and that
+// works only while every rank starts its CTAs in index order. Returns 128 when all 128 CTAs of
+// the released variant fit at once on the device (H100/H200: 132 SMs at one CTA per SM),
+// otherwise 64 (H20: 78 SMs). NEXRT_FUSED_L2_CTAS=128 or =64 overrides it, unset or empty
+// selects automatically, and any other value is an error. Errors return a negative CUDA error
+// code.
+inline int query_fused_l2_ctas(int device) {
+    const char* env = std::getenv("NEXRT_FUSED_L2_CTAS");
+    if (env != nullptr && env[0] != '\0') {
+        if (std::strcmp(env, "128") == 0) return 128;
+        if (std::strcmp(env, "64") == 0) return 64;
+        return -static_cast<int>(cudaErrorInvalidValue);
     }
-    return launch_fused_push<false>(
-        reinterpret_cast<const int32_t*>(topk_ids), reinterpret_cast<const float*>(topk_weights),
-        reinterpret_cast<const float*>(h), W2, reinterpret_cast<const float*>(w2_scales), shared_W2,
-        reinterpret_cast<const float*>(shared_w2_scales), rep_mc,
-        reinterpret_cast<const unsigned*>(rep_local), bar_mc, reinterpret_cast<int*>(bar_local),
-        reinterpret_cast<float*>(out), reinterpret_cast<int*>(status),
-        reinterpret_cast<unsigned*>(it_ctr), rank, num_ranks, stream);
+    int sms = 0;
+    int per_sm_plain = 0;
+    int per_sm_pf = 0;
+    cudaError_t err = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+    if (err == cudaSuccess) {
+        err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &per_sm_plain, FusedL2ReducePushKernel<false, 128>, 512, 0);
+    }
+    if (err == cudaSuccess) {
+        err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &per_sm_pf, FusedL2ReducePushKernel<true, 128>, 512, 0);
+    }
+    if (err != cudaSuccess) return -static_cast<int>(err);
+    const int per_sm = per_sm_plain < per_sm_pf ? per_sm_plain : per_sm_pf;
+    return per_sm * sms >= 128 ? 128 : 64;
 }
-#endif
 
-// Fused-residual form: writes x_resid[bf16] += reduced (in place) instead of out[fp32],
-// folding the decoder-layer residual add into the reduce epilogue. pf_base/pf_bytes
-// (nullable) L2-warm the next kernel's weights -- normally the NEXT layer's front GEMV
-// weights, clamped by the caller to what the peer-wait window absorbs -- during the wait.
-extern "C" int NexN25ProFusedL2ReduceResidLaunch(
-    const void* topk_ids, const void* topk_weights, const void* h, const void* W2,
-    const void* w2_scales, const void* shared_W2, const void* shared_w2_scales,
-    unsigned long long rep_mc, const void* rep_local, unsigned long long bar_mc, void* bar_local,
-    void* out, void* status, void* it_ctr, int rank, int num_ranks, void* x_resid,
-    const void* pf_base, long long pf_bytes, void* stream) {
+// The selection is fixed per process and device: the query runs once, and later launches only
+// read the cached value.
+inline int fused_l2_ctas() {
+    constexpr int kCachedDevices = 64;
+    static std::atomic<int> cached[kCachedDevices];  // 0 until the first successful query
+    int device = 0;
+    const cudaError_t err = cudaGetDevice(&device);
+    if (err != cudaSuccess) return -static_cast<int>(err);
+    if (device < 0 || device >= kCachedDevices) return query_fused_l2_ctas(device);
+    int ctas = cached[device].load(std::memory_order_relaxed);
+    if (ctas == 0) {
+        ctas = query_fused_l2_ctas(device);
+        if (ctas > 0) cached[device].store(ctas, std::memory_order_relaxed);
+    }
+    return ctas;
+}
+
+// Body of the fused-residual exports, with the grid passed in.
+inline int launch_fused_resid(const void* topk_ids, const void* topk_weights, const void* h,
+                              const void* W2, const void* w2_scales, const void* shared_W2,
+                              const void* shared_w2_scales, unsigned long long rep_mc,
+                              const void* rep_local, unsigned long long bar_mc, void* bar_local,
+                              void* out, void* status, void* it_ctr, int rank, int num_ranks,
+                              void* x_resid, const void* pf_base, long long pf_bytes, int ctas,
+                              void* stream) {
     if (num_ranks <= 0 || num_ranks > kMaxRanks || rep_mc == 0 || bar_mc == 0) {
         return static_cast<int>(cudaErrorInvalidValue);
     }
@@ -344,14 +386,76 @@ extern "C" int NexN25ProFusedL2ReduceResidLaunch(
     const char* pf = reinterpret_cast<const char*>(pf_base);
     if (pf != nullptr && pf_bytes > 0) {
         return launch_fused_push<true>(ids, tw, hh, W2, w2s, shared_W2, sw2s, rep_mc, rl, bar_mc,
-                                       bl, o, st, it, rank, num_ranks, stream, xr, pf,
+                                       bl, o, st, it, rank, num_ranks, ctas, stream, xr, pf,
                                        static_cast<long>(pf_bytes));
     }
     return launch_fused_push<false>(ids, tw, hh, W2, w2s, shared_W2, sw2s, rep_mc, rl, bar_mc, bl,
-                                    o, st, it, rank, num_ranks, stream, xr);
+                                    o, st, it, rank, num_ranks, ctas, stream, xr);
+}
+
+}  // namespace nexrt::sm90::nex_n2_5_pro::NEXRT_NEX_N2_5_PRO_KERNEL_FAMILY
+using namespace nexrt::sm90::nex_n2_5_pro::NEXRT_NEX_N2_5_PRO_KERNEL_FAMILY;
+#ifndef NEXRT_MTP_RUNTIME_ONLY
+extern "C" int NexN25ProFusedL2ReduceLaunch(const void* topk_ids, const void* topk_weights,
+                                            const void* h, const void* W2, const void* w2_scales,
+                                            const void* shared_W2, const void* shared_w2_scales,
+                                            unsigned long long rep_mc, const void* rep_local,
+                                            unsigned long long bar_mc, void* bar_local, void* out,
+                                            void* status, void* it_ctr, int rank, int num_ranks,
+                                            void* stream) {
+    if (num_ranks <= 0 || num_ranks > kMaxRanks || rep_mc == 0 || bar_mc == 0) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    const int ctas = fused_l2_ctas();
+    if (ctas < 0) return -ctas;
+    return launch_fused_push<false>(
+        reinterpret_cast<const int32_t*>(topk_ids), reinterpret_cast<const float*>(topk_weights),
+        reinterpret_cast<const float*>(h), W2, reinterpret_cast<const float*>(w2_scales), shared_W2,
+        reinterpret_cast<const float*>(shared_w2_scales), rep_mc,
+        reinterpret_cast<const unsigned*>(rep_local), bar_mc, reinterpret_cast<int*>(bar_local),
+        reinterpret_cast<float*>(out), reinterpret_cast<int*>(status),
+        reinterpret_cast<unsigned*>(it_ctr), rank, num_ranks, ctas, stream);
+}
+#endif
+
+// Fused-residual form: writes x_resid[bf16] += reduced (in place) instead of out[fp32],
+// folding the decoder-layer residual add into the reduce epilogue. pf_base/pf_bytes
+// (nullable) L2-warm the next kernel's weights -- normally the NEXT layer's front GEMV
+// weights, clamped by the caller to what the peer-wait window absorbs -- during the wait.
+extern "C" int NexN25ProFusedL2ReduceResidLaunch(
+    const void* topk_ids, const void* topk_weights, const void* h, const void* W2,
+    const void* w2_scales, const void* shared_W2, const void* shared_w2_scales,
+    unsigned long long rep_mc, const void* rep_local, unsigned long long bar_mc, void* bar_local,
+    void* out, void* status, void* it_ctr, int rank, int num_ranks, void* x_resid,
+    const void* pf_base, long long pf_bytes, void* stream) {
+    const int ctas = fused_l2_ctas();
+    if (ctas < 0) return -ctas;
+    return launch_fused_resid(topk_ids, topk_weights, h, W2, w2_scales, shared_W2, shared_w2_scales,
+                              rep_mc, rep_local, bar_mc, bar_local, out, status, it_ctr, rank,
+                              num_ranks, x_resid, pf_base, pf_bytes, ctas, stream);
 }
 
 #ifndef NEXRT_MTP_RUNTIME_ONLY
+// The grid that the two launchers above use on the current device: 128 or 64, or a negative
+// CUDA error code. moe.py all-gathers it at start and stops on a mismatch across ranks.
+extern "C" int NexN25ProFusedL2ReduceCtas() { return fused_l2_ctas(); }
+
+// The fused-residual form with an explicit grid, ctas 128 or 64 (other values return
+// cudaErrorInvalidValue). x_resid = NULL gives the plain form. The variants map row pairs to
+// different CTAs, and the per-CTA parity separates consecutive launches of one variant only.
+// So before a launch switches the variant on a workspace, every rank must finish the previous
+// launch.
+extern "C" int NexN25ProFusedL2ReduceResidLaunchCtas(
+    const void* topk_ids, const void* topk_weights, const void* h, const void* W2,
+    const void* w2_scales, const void* shared_W2, const void* shared_w2_scales,
+    unsigned long long rep_mc, const void* rep_local, unsigned long long bar_mc, void* bar_local,
+    void* out, void* status, void* it_ctr, int rank, int num_ranks, void* x_resid,
+    const void* pf_base, long long pf_bytes, int ctas, void* stream) {
+    return launch_fused_resid(topk_ids, topk_weights, h, W2, w2_scales, shared_W2, shared_w2_scales,
+                              rep_mc, rep_local, bar_mc, bar_local, out, status, it_ctr, rank,
+                              num_ranks, x_resid, pf_base, pf_bytes, ctas, stream);
+}
+
 extern "C" const char* NexN25ProFusedL2ReduceErrorString(int code) {
     return cudaGetErrorString(static_cast<cudaError_t>(code));
 }
