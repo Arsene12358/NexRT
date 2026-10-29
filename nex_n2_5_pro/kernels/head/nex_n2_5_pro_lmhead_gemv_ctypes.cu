@@ -25,7 +25,7 @@
 // Two geometries write the same bits. Geometry 0 (released) runs one CTA per row. Geometry 1 (H20)
 // runs kH20RowsPerCta rows per CTA and issues every load before the first multiply, so that an SM
 // keeps more bytes in flight. The launcher selects geometry 1 on devices with fewer than 128 SMs;
-// NEXRT_H20_GEOMETRY overrides it (see lmhead_geometry).
+// NEXRT_H20_GEOMETRY overrides it (see h20_geometry.cuh).
 #ifndef NEXRT_NEX_N2_5_PRO_KERNEL_FAMILY
 #define NEXRT_NEX_N2_5_PRO_KERNEL_FAMILY bs1
 #endif
@@ -34,9 +34,7 @@
 #include <cuda_runtime.h>
 #include <cub/block/block_reduce.cuh>
 
-#include <atomic>
-#include <cstdlib>
-#include <cstring>
+#include "../common/h20_geometry.cuh"
 
 namespace nexrt::sm90::nex_n2_5_pro::NEXRT_NEX_N2_5_PRO_KERNEL_FAMILY {
 constexpr int kDim = 4096;
@@ -184,51 +182,20 @@ inline int LaunchGeometry(const void* h, const void* Wf, void* logits, float* in
     }
     return static_cast<int>(cudaErrorInvalidValue);
 }
-
-// Geometry selection: 1 on devices with fewer than 128 SMs (H20: 78), else 0 (H100 SXM and
-// H200: 132). NEXRT_H20_GEOMETRY=0 or =1 overrides it, unset or empty selects automatically, and
-// any other value is an error. Errors return a negative CUDA error code. The kernel reads only this
-// rank's shard, so ranks need not agree.
-inline int query_lmhead_geometry(int device) {
-    const char* env = std::getenv("NEXRT_H20_GEOMETRY");
-    if (env != nullptr && env[0] != '\0') {
-        if (std::strcmp(env, "0") == 0) return 0;
-        if (std::strcmp(env, "1") == 0) return 1;
-        return -static_cast<int>(cudaErrorInvalidValue);
-    }
-    int sms = 0;
-    const cudaError_t err = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
-    if (err != cudaSuccess) return -static_cast<int>(err);
-    return sms < 128 ? 1 : 0;
-}
-
-// The selection is fixed per process and device: the query runs once, and later launches only read
-// the cached value.
-inline int lmhead_geometry() {
-    constexpr int kCachedDevices = 64;
-    static std::atomic<int> cached[kCachedDevices];  // geometry + 1, 0 until a query succeeds
-    int device = 0;
-    const cudaError_t err = cudaGetDevice(&device);
-    if (err != cudaSuccess) return -static_cast<int>(err);
-    if (device < 0 || device >= kCachedDevices) return query_lmhead_geometry(device);
-    const int stored = cached[device].load(std::memory_order_relaxed);
-    if (stored != 0) return stored - 1;
-    const int geometry = query_lmhead_geometry(device);
-    if (geometry >= 0) cached[device].store(geometry + 1, std::memory_order_relaxed);
-    return geometry;
-}
 }  // namespace nexrt::sm90::nex_n2_5_pro::NEXRT_NEX_N2_5_PRO_KERNEL_FAMILY
 using namespace nexrt::sm90::nex_n2_5_pro::NEXRT_NEX_N2_5_PRO_KERNEL_FAMILY;
 extern "C" {
+// The geometry follows the device and NEXRT_H20_GEOMETRY (h20_geometry.cuh). The kernel reads only
+// this rank's shard, so ranks need not agree.
 int NexN25ProLmHeadGemvLaunch(const void* h, const void* Wf, void* o, float* r, float e, void* s) {
-    const int geometry = lmhead_geometry();
+    const int geometry = h20_geometry();
     if (geometry < 0) return -geometry;
     return LaunchGeometry(h, Wf, o, r, e, geometry, s);
 }
 #ifndef NEXRT_MTP_RUNTIME_ONLY
 // The geometry that NexN25ProLmHeadGemvLaunch uses on the current device: 0 or 1, or a negative CUDA
 // error code (an invalid NEXRT_H20_GEOMETRY gives -cudaErrorInvalidValue). head.py checks it at start.
-int NexN25ProLmHeadGemvGeometry() { return lmhead_geometry(); }
+int NexN25ProLmHeadGemvGeometry() { return h20_geometry(); }
 
 // NexN25ProLmHeadGemvLaunch with an explicit geometry: 0 = released, 1 = H20. Other values return
 // cudaErrorInvalidValue without a launch.

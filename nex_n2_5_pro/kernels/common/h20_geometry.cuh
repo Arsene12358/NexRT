@@ -15,12 +15,13 @@
 // Launch geometry of the kernels that have an H20 variant. Geometry 0 is the released grid.
 // Geometry 1 gives each thread block more rows, so that the grid fits one round of thread blocks
 // (fewer rounds for the CP front) on a GPU with fewer SMs (H20: 78), where the released grid needs
-// a partial extra round. Both geometries compute each output with the same operations in the same
-// order, so they give bitwise-identical outputs.
+// a partial extra round. In the LM head GEMV, the extra rows keep more loads in flight per thread.
+// Both geometries compute each output with the same operations in the same order, so they give
+// bitwise-identical outputs.
 //
 // NEXRT_H20_GEOMETRY=0 or =1 forces the geometry. Unset or empty selects geometry 1 when the
-// device has fewer than 128 SMs, else geometry 0 (H100 and H200: 132 SMs). Any other value is an
-// error.
+// device has fewer than 128 SMs, else geometry 0 (H100 SXM and H200: 132 SMs). Any other value is
+// an error.
 #ifndef NEXRT_NEX_N2_5_PRO_KERNEL_FAMILY
 #define NEXRT_NEX_N2_5_PRO_KERNEL_FAMILY bs1
 #endif
