@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) Nex-AGI. All rights reserved.
-#
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -176,6 +176,15 @@ class Gdn:
         # fp32, multicast-written); bar = one NVLS arrival slot per CTA; it_ctr = per-CTA epochs
         # (monotonic -- parity and spin targets derive from them, no host resets).
         if share_from is None:
+            # The front launcher picks its geometry per device (local data only).
+            geometry = self.fl.NexN25ProLinearFrontGeometry()
+            if geometry not in (0, 1):
+                raise RuntimeError(
+                    f"invalid GDN front geometry {geometry} (a negative CUDA error code). "
+                    "NEXRT_H20_GEOMETRY must be unset, empty, 0 or 1."
+                )
+            if rank == 0:
+                print(f"[gdn] front geometry={geometry}", flush=True)
             self.rep, _, self.rep_mc = self._symm(8 * 2 * HID, torch.float32)
             self.rep.zero_()
             self.bar, _, self.bar_mc = self._symm(128, torch.int32)
