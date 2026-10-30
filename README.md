@@ -3,7 +3,8 @@
 **NexRT** is a low-latency **1-batch decode engine** built with custom CUDA
 kernels and CUDA graphs.
 
-NexRT currently supports **Nex-N2.5-Pro** on **8×H100 or H200 (TP=8)**.
+NexRT currently supports **Nex-N2.5-Pro** on **8×H100 or H200 (TP=8)**. It also
+runs 1-batch decoding on **8×H20-3e (TP=8)**. See [H20-3e](#h20-3e).
 Each engine uses one of the following modes:
 
 - **1-batch decoding (BS=1)**
@@ -25,7 +26,8 @@ of output tokens committed per round.
 
 ## Requirements
 
-- **Hardware:** 8×NVIDIA H100 or H200 with TP=8 and NVLS multicast support.
+- **Hardware:** 8×NVIDIA H100, H200, or H20-3e with TP=8 and NVLS multicast
+  support. H20-3e runs 1-batch decoding only. See [H20-3e](#h20-3e).
 - **Software:** Linux, Bash 4+, CUDA Toolkit 12.9+, Python 3.10+, PyTorch 2.6+,
   and safetensors.
   Prefill requires SGLang, transformers, tokenizers, and numpy. The bridge is
@@ -43,6 +45,26 @@ of output tokens committed per round.
 Ensure the GPU host can find CUDA tools and libraries. Adjust `PATH` for
 `nvcc` and `nvidia-smi`, `LD_LIBRARY_PATH` for runtime libraries, and
 `LIBRARY_PATH` for linking against `libcuda.so` as needed for your environment.
+
+## H20-3e
+
+8×H20-3e (78 SMs, TP=8) runs the single-token decode path, which is the 1-batch
+mode. It runs with and without CP, for prompts up to 261,888 tokens. `--mtp` and
+`--dflash` are not ported to H20-3e yet.
+
+The H20-3e validation used the Qwen3.5-397B-A17B-FP8 checkpoint. It covered
+correctness gates, determinism runs, and a 4-hour soak at prompt lengths from
+1,024 to 261,888 tokens.
+
+H100 and H200 keep the released kernels, grids, and split counts. The launcher
+selects an H20 variant only on a GPU where 128 blocks do not fit at once. Three
+variables override this selection. They are for testing.
+
+| Variable | Effect |
+| --- | --- |
+| `NEXRT_H20_GEOMETRY` | Launch geometry of the gate/up, GDN front, CP front, and LM head kernels. `0` is the released grid. `1` is the H20 grid, which gives each thread block more rows. Unset or empty selects `1` on a GPU with fewer than 128 SMs, and `0` otherwise (H100 SXM and H200 have 132 SMs). Any other value stops the process at start. |
+| `NEXRT_FUSED_L2_CTAS` | Number of thread blocks (CTAs) of the MoE FusedL2 reduce kernel. `128` is the released grid. `64` is the H20 variant. Unset or empty selects `128` on a GPU where all 128 blocks fit at once (H100 and H200: 132 SMs at one block per SM), and `64` otherwise (H20-3e: 78 SMs). Any other value stops the process at start. |
+| `NEXRT_CP_SPLITS` | Split count of the CP attention megakernel. Read only with CP on, which is the default (`--no-cp` turns it off). `128` is the released split count. `64` is the H20 variant. Unset or empty selects the larger of `128` and `64` whose grid fits on the GPU at once. It is an error at start where neither fits. Any other value stops the process at start. The launcher still refuses a forced count whose grid does not fit at once. |
 
 ## Quick start
 

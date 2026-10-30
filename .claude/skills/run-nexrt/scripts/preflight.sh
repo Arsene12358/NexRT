@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copyright (c) Nex-AGI. All rights reserved.
-#
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -109,7 +109,7 @@ fi
 head2 'GPUs'
 if ! command -v nvidia-smi >/dev/null 2>&1; then
     bad "nvidia-smi not found -- no NVIDIA driver visible in this environment"
-    info "NexRT needs 8 physical H100 or H200 GPUs; a CPU-only box cannot run any part of the service"
+    info "NexRT needs 8 physical H100, H200, or H20-3e GPUs; a CPU-only box cannot run any part of the service"
 else
     GPU_QUERY='index,name,compute_cap,memory.total,memory.used,mig.mode.current'
     mapfile -t GPU_ROWS < <(nvidia-smi --query-gpu="$GPU_QUERY" --format=csv,noheader,nounits 2>/dev/null)
@@ -143,7 +143,7 @@ else
             *)
                 warn "GPU $idx: driver did not report compute_cap ('$cc'); name is '$name'"
                 case "$name" in
-                    *H100*|*H200*) info "name looks like Hopper; treating as sm_90 but verify before trusting a run" ;;
+                    *H100*|*H200*|*H20-3e*) info "name looks like Hopper; treating as sm_90 but verify before trusting a run" ;;
                     *)      arch_idx+=("$idx"); arch_kinds+=("unknown ($name)") ;;
                 esac
                 ;;
