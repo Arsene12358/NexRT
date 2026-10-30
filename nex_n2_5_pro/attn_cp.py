@@ -80,7 +80,17 @@ def _check_num_splits(megatl, rank, world, dev):
     dist.all_gather_into_tensor(gathered, mine)
     splits = gathered.tolist()
     if min(splits) < 0:
-        raise RuntimeError(f"NexN25ProCpAttnMegaNumSplits failed (by rank): {splits}")
+        decode = megatl.NexN25ProCpAttnMegaErrorString
+        decode.argtypes, decode.restype = [ctypes.c_int], ctypes.c_char_p
+        errors = sorted({-code for code in splits if code < 0})
+        reasons = ", ".join(f"{error} ({decode(error).decode()})" for error in errors)
+        value = os.environ.get("NEXRT_CP_SPLITS")
+        raise RuntimeError(
+            f"NexN25ProCpAttnMegaNumSplits failed (by rank): {splits}. A negative value is a CUDA "
+            f"error code with its sign flipped: {reasons}. NEXRT_CP_SPLITS is "
+            f"{'unset' if value is None else repr(value)} on this rank. Valid values are unset, "
+            "empty, 64 and 128."
+        )
     if len(set(splits)) != 1:
         raise RuntimeError(f"CP split count differs across ranks: {splits}")
     if rank == 0:

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) Nex-AGI. All rights reserved.
-#
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -15,7 +15,8 @@
 
 """The production WGMMA attention megakernel must match between fixed-S and device-S launches.
 
-Run on one Hopper GPU (including H20's non-cooperative fallback):
+The cooperative launch is capped at the GPU's capacity, so H20-3e runs 78 splits where H100 and
+H200 run 128. Run on one Hopper GPU:
   python3 nex_n2_5_pro/tests/test_attn_core_dyn.py
 """
 
@@ -117,8 +118,10 @@ def main():
         ok = max_abs == 0.0
         failures += int(not ok)
         print(f"S={s:6d} fixed-vs-device max_abs={max_abs:.3e} {'OK' if ok else 'MISMATCH'}")
-        # A separate FP32 reference catches errors shared by both launch paths,
-        # including empty partials when a short prompt has fewer than 128 tokens.
+        # A separate FP32 reference catches errors shared by both launch paths, including empty
+        # partials when a short prompt has fewer tokens than splits. H100 and H200 run 128 splits,
+        # so their split edges are S = 127 to 129. H20-3e runs 78 splits, so the lengths with
+        # empty splits here are 1 and 27, and its split edges are S = 77 to 79.
         scores = q.float() @ k[:s].float().T / (HD**0.5)
         reference = scores.softmax(-1) @ v[:s].float()
         reference_error = float((dynamic[3].float() - reference).abs().max())
