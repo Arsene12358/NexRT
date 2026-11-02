@@ -64,7 +64,7 @@ variables override this selection. They are for testing.
 | --- | --- |
 | `NEXRT_H20_GEOMETRY` | Launch geometry of the gate/up, GDN front, CP front, and LM head kernels. `0` is the released grid. `1` is the H20 grid, which gives each thread block more rows. Unset or empty selects `1` on a GPU with fewer than 128 SMs, and `0` otherwise (H100 SXM and H200 have 132 SMs). Any other value stops the process at start. |
 | `NEXRT_FUSED_L2_CTAS` | Number of thread blocks (CTAs) of the MoE FusedL2 reduce kernel. `128` is the released grid. `64` is the H20 variant. Unset or empty selects `128` on a GPU where all 128 blocks fit at once (H100 and H200: 132 SMs at one block per SM), and `64` otherwise (H20-3e: 78 SMs). Any other value stops the process at start. |
-| `NEXRT_CP_SPLITS` | Split count of the CP attention megakernel. Read only with CP on, which is the default (`--no-cp` turns it off). `128` is the released split count. `64` is the H20 variant. Unset or empty selects the larger of `128` and `64` whose grid fits on the GPU at once. It is an error at start where neither fits. Any other value stops the process at start. The launcher still refuses a forced count whose grid does not fit at once. |
+| `NEXRT_CP_SPLITS` | Split count of the CP attention megakernel. Read only with CP on, which is the default (`--no-cp` turns it off). `128` is the released split count. `64` is the H20 variant. Unset or empty selects the larger of `128` and `64` whose grid fits on the GPU at once. It is an error at start where neither fits. Any other value stops the process at start. The launcher still refuses a forced count whose grid does not fit at once. It checks this at the first request whose prompt length plus maximum output length reaches 49,152 tokens, not at start. The refusal stops the process. |
 
 ## Quick start
 
@@ -106,10 +106,10 @@ NEXRT_SCRIPTS=.claude/skills/run-nexrt/scripts
 # 1-batch (default):
 "$NEXRT_SCRIPTS/serve.sh" --background --python "$NEXRT_PYTHON"
 
-# Or MTP M=4:
+# Or MTP M=4 (not ported to H20-3e yet):
 # "$NEXRT_SCRIPTS/serve.sh" --background --python "$NEXRT_PYTHON" -- --mtp
 
-# Or DFlash M=8:
+# Or DFlash M=8 (not ported to H20-3e yet):
 # export NEXRT_DFLASH_DIR=/path/to/dflash-checkpoint
 # "$NEXRT_SCRIPTS/serve.sh" --background --python "$NEXRT_PYTHON" -- --dflash
 
