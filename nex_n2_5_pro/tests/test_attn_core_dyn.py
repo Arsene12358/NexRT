@@ -109,7 +109,7 @@ def main():
         if rc:
             raise RuntimeError(f"device-S WGMMA launch returned CUDA error {rc}")
 
-    for s in (1, 27, 127, 128, 129, 512, 1024, 2049, 4096, 16384):
+    for s in (1, 27, 77, 78, 79, 127, 128, 129, 512, 1024, 2049, 4096, 16384):
         slot[1] = s - 1
         launch_fixed(s, fixed)
         launch_dynamic(dynamic)
@@ -121,7 +121,7 @@ def main():
         # A separate FP32 reference catches errors shared by both launch paths, including empty
         # partials when a short prompt has fewer tokens than splits. H100 and H200 run 128 splits,
         # so their split edges are S = 127 to 129. H20-3e runs 78 splits, so the lengths with
-        # empty splits here are 1 and 27, and its split edges are S = 77 to 79.
+        # empty splits here are 1, 27 and 77, and its split edges are S = 77 to 79.
         scores = q.float() @ k[:s].float().T / (HD**0.5)
         reference = scores.softmax(-1) @ v[:s].float()
         reference_error = float((dynamic[3].float() - reference).abs().max())
@@ -138,7 +138,7 @@ def main():
     with torch.cuda.graph(graph):
         launch_dynamic(dynamic)
     torch.cuda.synchronize()
-    for s in (1, 27, 129, 512, 2049, 4096):
+    for s in (1, 27, 77, 78, 79, 129, 512, 2049, 4096):
         slot[1] = s - 1
         graph.replay()
         launch_fixed(s, fixed)
